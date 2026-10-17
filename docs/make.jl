@@ -1,4 +1,4 @@
-using Documenter, DocumenterCitations, DocumenterInterLinks, Mooncake
+using Documenter, DocumenterCitations, Mooncake
 
 DocMeta.setdocmeta!(
     Mooncake,
@@ -13,24 +13,18 @@ DocMeta.setdocmeta!(
     recursive=true,
 )
 
-links = InterLinks(
-    "ADTypes" => "https://sciml.github.io/ADTypes.jl/stable/",
-    "DifferentiationInterface" => "https://juliadiff.org/DifferentiationInterface.jl/DifferentiationInterface/stable/",
-)
-
 makedocs(;
     sitename="Mooncake.jl",
     format=Documenter.HTML(;
         mathengine=Documenter.KaTeX(Dict(:macros => Dict("\\RR" => "\\mathbb{R}"))),
         size_threshold_ignore=[
-            joinpath("developer_documentation", "internal_docstrings.md")
+            joinpath("developer_documentation", "internal_docstrings.md"),
+            joinpath("developer_documentation", "advanced_debugging.md"),
         ],
     ),
     modules=[Mooncake],
     checkdocs=:none,
-    plugins=[
-        CitationBibliography(joinpath(@__DIR__, "src", "refs.bib"); style=:numeric), links
-    ],
+    plugins=[CitationBibliography(joinpath(@__DIR__, "src", "refs.bib"); style=:numeric)],
     pages=[
         "Mooncake.jl" => "index.md",
         "Tutorial" => "tutorial.md",
@@ -39,6 +33,7 @@ makedocs(;
             joinpath("understanding_mooncake", "introduction.md"),
             joinpath("understanding_mooncake", "algorithmic_differentiation.md"),
             joinpath("understanding_mooncake", "rule_system.md"),
+            joinpath("understanding_mooncake", "what_programme_are_you_differentiating.md"),
         ],
         "Utilities" => [
             joinpath("utilities", "defining_rules.md"),
@@ -50,10 +45,12 @@ makedocs(;
             joinpath("developer_documentation", "developer_tools.md"),
             joinpath("developer_documentation", "tangents.md"),
             joinpath("developer_documentation", "custom_tangent_type.md"),
+            joinpath("developer_documentation", "scalar_rules_via_ndual.md"),
             joinpath("developer_documentation", "ir_representation.md"),
             joinpath("developer_documentation", "forwards_mode_design.md"),
             joinpath("developer_documentation", "reverse_mode_design.md"),
             joinpath("developer_documentation", "misc_internals_notes.md"),
+            joinpath("developer_documentation", "advanced_debugging.md"),
             joinpath("developer_documentation", "internal_docstrings.md"),
         ],
         "known_limitations.md",

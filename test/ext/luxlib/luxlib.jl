@@ -6,6 +6,13 @@ using JET, Lux, LuxLib, Mooncake, NNlib, SLEEFPirates, StableRNGs, Test
 using LuxLib.Impl: sleefpirates_fast_act
 using Mooncake.TestUtils: test_rule
 
+# Custom activation to exercise fallback paths (no pre-defined rrule, needs intermediate).
+_custom_act(x) = x^2 + 1
+
+# Access AD helper functions present in the Extension module.
+const MooncakeLuxLibExt = Base.get_extension(Mooncake, :MooncakeLuxLibExt)
+@assert !isnothing(MooncakeLuxLibExt) "MooncakeLuxLibExt is required for testing !"
+
 @testset "luxlib" begin
     @testset "$(typeof(fargs))" for (interface_only, perf_flag, is_primitive, fargs...) in
                                     vcat(
@@ -45,30 +52,194 @@ using Mooncake.TestUtils: test_rule
                 LuxLib.Utils.True(),
                 LuxLib.Utils.True(),
             ),
+            (false, :stability_and_allocs, true, LuxLib.Impl.dropout_shape, randn(4, 4), :),
             (
                 false,
-                :none,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.dropout_fptype,
+                randn(Float32, 4, 4),
+            ),
+            (
                 false,
-                function (opmode, act, x, m, sigma2, gamma, beta)
-                    return LuxLib.Impl.batchnorm_affine_normalize_internal(
-                        opmode, act, x, m, sigma2, gamma, beta, 1e-3
-                    )
-                end,
-                LuxLib.LoopedArrayOp(),
-                Lux.relu,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.check_dropout_mask_shape_mismatch,
+                randn(4, 4),
+                randn(4, 4),
+                :,
+            ),
+            (
+                true,
+                :stability,
+                true,
+                LuxLib.Impl.generate_dropout_mask,
+                StableRNG(123),
+                randn(Float32, 4, 4),
+                0.5f0,
+                2.0f0,
+                :,
+            ),
+            (
+                false,
+                :stability,
+                true,
+                LuxLib.Impl.generate_alpha_dropout_noise,
+                StableRNG(123),
+                randn(Float32, 4, 4),
+            ),
+            (
+                false,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.batchnorm_reduce_dims,
+                randn(5, 4, 3),
+            ),
+            (
+                true,
+                :stability,
+                true,
+                LuxLib.Impl.get_batchnorm_statistics,
                 randn(5, 4, 3),
                 randn(4),
-                rand(4) .+ 1.0,
+                randn(4),
+                LuxLib.Utils.True(),
+            ),
+            (
+                true,
+                :stability,
+                true,
+                LuxLib.Impl.update_running_statistics,
+                randn(4),
+                randn(4),
+                randn(4),
+                randn(4),
+                0.9,
+                0.1,
+            ),
+            (
+                true,
+                :stability,
+                true,
+                LuxLib.Impl.update_normalization_statistics,
+                randn(5, 4, 3),
+                zeros(1, 4, 1),
+                zeros(1, 4, 1),
+                zeros(1, 4, 1),
+                ones(1, 4, 1),
+                0.1,
+                (Val(1), Val(3)),
+            ),
+            (
+                false,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.groupnorm_reduce_dims,
+                randn(4, 4, 2),
+            ),
+            (
+                false,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.instancenorm_reduce_dims,
+                randn(5, 4, 3),
+            ),
+            (
+                false,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.compute_layernorm_dims,
+                randn(4, 3),
+                randn(5, 4, 1),
+                randn(4, 1),
                 nothing,
-                nothing,
+            ),
+            (
+                false,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.get_norm_reshape_dims,
+                (4, 4, 2),
+                4,
+            ),
+            (
+                false,
+                :stability_and_allocs,
+                true,
+                LuxLib.Impl.flattened_bias_dims,
+                randn(5, 4),
+            ),
+            (false, :stability, true, LuxLib.Impl.get_non_heads_dim, 3, 1),
+            (false, :stability, true, LuxLib.Impl.make_causal_mask, randn(4, 4), 4, 4),
+            (false, :stability, true, LuxLib.Impl.get_non_contracting_dim, 3, 1, (2,)),
+            (
+                false,
+                :stability,
+                true,
+                LuxLib.Impl.get_batched_matmul_repeat_dims,
+                randn(5, 4, 3),
+                randn(4, 3, 3),
+                (3,),
+                (3,),
             ),
         ],
         vec(
             map(
                 Iterators.product(
+                    [LuxLib.LoopedArrayOp()], [(nothing, nothing), (randn(4), randn(4))]
+                ),
+            ) do (opmode, (gamma, beta))
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, x, m, sigma2, gamma, beta)
+                        return MooncakeLuxLibExt._batchnorm_affine_normalize_identity(
+                            opmode, x, m, sigma2, gamma, beta, 1e-3
+                        )
+                    end,
+                    opmode,
+                    randn(5, 4, 3),
+                    randn(4),
+                    rand(4) .+ 1.0,
+                    gamma,
+                    beta,
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp()],
+                    [(nothing, nothing), (randn(4), randn(4))],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, (gamma, beta), activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x, m, sigma2, gamma, beta)
+                        return LuxLib.Impl.batchnorm_affine_normalize_internal(
+                            opmode, act, x, m, sigma2, gamma, beta, 1e-3
+                        )
+                    end,
+                    opmode,
+                    activation,
+                    randn(5, 4, 3),
+                    randn(4),
+                    rand(4) .+ 1.0,
+                    gamma,
+                    beta,
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
                     [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
                     [randn(5), nothing],
-                    [Lux.relu, tanh, NNlib.gelu],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
                 ),
             ) do (opmode, bias, activation)
                 (
@@ -81,6 +252,216 @@ using Mooncake.TestUtils: test_rule
                     randn(5, 4),
                     randn(4, 2),
                     bias,
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x, bias)
+                        return LuxLib.Impl.bias_activation(opmode, act, x, bias)
+                    end,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                    randn(5),
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x, bias)
+                        return LuxLib.Impl.bias_activation!!(
+                            opmode, LuxLib.Utils.True(), act, x, bias
+                        )
+                    end,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                    randn(5),
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x, bias)
+                        return LuxLib.Impl.bias_activation!!(
+                            opmode, LuxLib.Utils.False(), act, x, bias
+                        )
+                    end,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                    randn(5),
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x)
+                        return LuxLib.Impl.activation!!(
+                            opmode, LuxLib.Utils.True(), act, x
+                        )
+                    end,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x)
+                        return LuxLib.Impl.activation!!(
+                            opmode, LuxLib.Utils.False(), act, x
+                        )
+                    end,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    LuxLib.Impl.activation,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [randn(3), nothing],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, bias, activation)
+                cdims = NNlib.DenseConvDims(
+                    randn(6, 6, 2, 3),
+                    randn(3, 3, 2, 3);
+                    stride=(1, 1),
+                    padding=(0, 0),
+                    dilation=(1, 1),
+                )
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, weight, x, bias, cdims)
+                        return LuxLib.Impl.fused_conv(opmode, act, weight, x, bias, cdims)
+                    end,
+                    opmode,
+                    activation,
+                    randn(3, 3, 2, 3),
+                    randn(6, 6, 2, 3),
+                    bias === nothing ? nothing : randn(3),
+                    cdims,
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp(), LuxLib.GenericBroadcastOp{Lux.CPUDevice()}()],
+                    [randn(5), nothing],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                ),
+            ) do (opmode, bias, activation)
+                (
+                    false,
+                    :none,
+                    false,
+                    LuxLib.Impl.fused_dense,
+                    opmode,
+                    activation,
+                    randn(5, 4),
+                    randn(4, 2),
+                    bias,
+                )
+            end,
+        ),
+        vec(
+            map(
+                Iterators.product(
+                    [LuxLib.LoopedArrayOp()],
+                    [Lux.relu, tanh, NNlib.gelu, identity, _custom_act],
+                    [true, false],
+                ),
+            ) do (opmode, activation, affine)
+                γ = affine ? randn(1, 2, 2, 1) : nothing
+                β = affine ? randn(1, 2, 2, 1) : nothing
+                (
+                    false,
+                    :none,
+                    false,
+                    function (opmode, act, x, μ, σ², γ, β)
+                        return LuxLib.Impl.groupnorm_affine_normalize_internal(
+                            opmode, act, x, μ, σ², γ, β, 1e-3
+                        )
+                    end,
+                    opmode,
+                    activation,
+                    randn(4, 2, 2, 3),
+                    randn(1, 1, 2, 3),
+                    rand(1, 1, 2, 3) .+ 1.0,
+                    γ,
+                    β,
                 )
             end,
         ),

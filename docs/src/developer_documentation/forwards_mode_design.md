@@ -1,7 +1,5 @@
 # Forwards-Mode Design
 
-**Disclaimer**: this document refers to an as-yet-unimplemented forwards-mode AD. This will disclaimer will be removed once it has been implemented.
-
 The purpose of this document is to explain how forwards-mode AD in Mooncake.jl is implemented.
 It should do so to a sufficient level of depth to enable the interested reader to read to the forwards-mode AD code in Mooncake.jl and understand what is going on.
 
@@ -17,7 +15,7 @@ This document
 
 Loosely, a rule for a function simultaneously
 1. performs the same computation as the original function, and
-1. computes the Frechet derivative.
+1. computes the Fréchet derivative.
 
 This is best explained through a worked example.
 Consider a function call
@@ -70,8 +68,8 @@ Hand-written rules are implemented by writing methods of two functions: `is_prim
 
 ### `is_primitive`
 
-`is_primitive(::Type{<:Union{MinimalForwardsCtx, DefaultForwardsCtx}}, signature::Type{<:Tuple})` should return `true` if AD must attempt to differentiate a call by passing the arguments to `frule!!`, and `false` otherwise.
-The [`Mooncake.@is_primitive`](@ref) macro helps makes implementing this very easy.
+`is_primitive(::Type{<:Union{MinimalForwardsCtx, DefaultForwardsCtx}}, signature::Type{<:Tuple}, world)` must return `true` if AD must attempt to differentiate a call by passing the arguments to `frule!!`, and `false` otherwise.
+The [`Mooncake.@is_primitive`](@ref) macro must be used to extend to create new primitives.
 
 ### `frule!!`
 
@@ -203,7 +201,7 @@ This function has methods with will return the `IRCode` associated to:
 1. `Base.MethodInstances` (relevant for `:invoke` expressions -- see [Statement Transformation](@ref) below)
 1. `MistyClosures.MistyClosure` objects, which is essential when computing higher order derivatives and Hessians by applying Mooncake.jl to itself.
 
-#### Standardisation
+#### [Standardisation](@id standardisation)
 
 We apply the following transformations to the Julia IR.
 They can all be found in `ir_normalisation.jl`:
@@ -217,6 +215,10 @@ The purpose of converting `Expr(:foreigncall...)`, `Expr(:new, ...)` and `Expr(:
 
 The purpose of translating `Expr(:call, ::IntrinsicFunction, ...)` is to do with type stability -- see the docstring for the [Mooncake.IntrinsicsWrappers](@ref) module for more info.
 
+Native `gc_preserve_begin` / `gc_preserve_end` scopes are retained in forwards-mode AD.
+The preserved owners are mapped to `Dual` values, keeping both primal and tangent storage alive throughout the scope.
+The end expression still consumes the native begin token, not a `Dual`.
+Preserving raw pointers alone does not keep their owning Julia objects alive.
 
 #### Statement Transformation
 
@@ -245,7 +247,7 @@ There are three cases to consider, in order of preference:
 Primitives:
 
 If `is_primitive` returns `true` when applied to the signature constructed from the static types of `f` and `x`, then we simply replace the expression with `Expr(:call, frule!!, f, x...)`, regardless whether we have an `:invoke` or `:call` expression.
-(Due to the [Standardisation](@ref) steps, it regularly happens that we see `:call` expressions in which we actually do know enough type information to do this, e.g. for `Mooncake._new_` `:call` expressions).
+(Due to the [Standardisation](@ref standardisation) steps, it regularly happens that we see `:call` expressions in which we actually do know enough type information to do this, e.g. for `Mooncake._new_` `:call` expressions).
 
 Static Dispatch:
 
@@ -336,7 +338,7 @@ Then, instead of propagating a "primal-tangent" pairs via `Dual`s, we propagate 
 The implementation of forwards-mode AD is quite dramatically simpler than that of reverse-mode AD.
 Some notable technical differences include:
 1. forwards-mode AD only makes use of the tangent system, whereas reverse-mode also makes use of the fdata / rdata system.
-1. forwards-mode AD comprises only line-by-line transformations of the `IRCode`. In particular, it does not require the insertion of additional basic blocks, nor the modification of the successors / predecessors of any given basic block. Consequently, there is no need to make use of the `BBCode` infrastructure built up for reverse-mode AD -- everything can be straightforwardly done at the `Compiler.IRCode` level.
+1. forwards-mode AD comprises only line-by-line transformations of the `IRCode`. In particular, it does not require the insertion of additional basic blocks, nor the modification of the successors / predecessors of any given basic block. Consequently, there is no need to make use of the `CFGBlock` infrastructure built up for reverse-mode AD -- everything can be straightforwardly done at the `Compiler.IRCode` level.
 
 ## Comparison with ForwardDiff.jl
 

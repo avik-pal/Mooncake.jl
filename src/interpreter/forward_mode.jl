@@ -1,3 +1,31 @@
+# Check if a type contains Union{} (bottom type) anywhere in its structure.
+# This can happen with unreachable code or failed type inference.
+@inline contains_bottom_type(T) = _contains_bottom_type(T, Base.IdSet{Any}())
+
+function _contains_bottom_type(T, seen::Base.IdSet{Any})
+    T === Union{} && return true
+    if T isa Union
+        return _contains_bottom_type(T.a, seen) || _contains_bottom_type(T.b, seen)
+    elseif T isa TypeVar
+        T in seen && return false
+        push!(seen, T)
+        return _contains_bottom_type(T.ub, seen)
+    elseif T isa UnionAll
+        T in seen && return false
+        push!(seen, T)
+        return _contains_bottom_type(T.body, seen)
+    elseif T isa DataType
+        T in seen && return false
+        push!(seen, T)
+        for p in T.parameters
+            _contains_bottom_type(p, seen) && return true
+        end
+        return false
+    else
+        return false
+    end
+end
+
 function build_frule(args...; debug_mode=false, silence_debug_messages=true)
     sig = _typeof(TestUtils.__get_primals(args))
     interp = get_interpreter(ForwardMode)
@@ -10,14 +38,34 @@ struct DualRuleInfo
     dual_ret_type::Type
 end
 
+"""
+    build_frule(
+        interp::MooncakeInterpreter{C},
+        sig_or_mi;
+        debug_mode=false,
+        silence_debug_messages=true,
+        skip_world_age_check=false,
+    ) where {C}
+
+Returns a function which performs forward-mode AD for `sig_or_mi`. Will derive a rule if
+`sig_or_mi` is not a primitive.
+
+Set `skip_world_age_check=true` when the interpreter's world age is intentionally older
+than the current world (e.g. when building rules for a MistyClosure, which uses its own
+world, or when a Lazy/Dynamic rule rebuilds at its stored prediction world; see issue #1218).
+"""
 function build_frule(
-    interp::MooncakeInterpreter{C}, sig_or_mi; debug_mode=false, silence_debug_messages=true
+    interp::MooncakeInterpreter{C},
+    sig_or_mi;
+    debug_mode=false,
+    silence_debug_messages=true,
+    skip_world_age_check=false,
 ) where {C}
     @nospecialize sig_or_mi
 
     # To avoid segfaults, ensure that we bail out if the interpreter's world age is greater
     # than the current world age.
-    if Base.get_world_counter() > interp.world
+    if !skip_world_age_check && Base.get_world_counter() > interp.world
         throw(
             ArgumentError(
                 "World age associated to interp is behind current world age. Please " *
@@ -33,7 +81,10 @@ function build_frule(
 
     # If we have a hand-coded rule, just use that.
     sig = _get_sig(sig_or_mi)
-    is_primitive(C, ForwardMode, sig) && return (debug_mode ? DebugFRule(frule!!) : frule!!)
+    if is_primitive(C, ForwardMode, sig, interp.world)
+        rule = build_primitive_frule(sig)
+        return debug_mode ? DebugFRule(rule) : rule
+    end
 
     # We don't have a hand-coded rule, so derive one.
     lock(MOONCAKE_INFERENCE_LOCK)
@@ -49,6 +100,7 @@ function build_frule(
             dual_oc = misty_closure(
                 info.dual_ret_type, dual_ir, captures...; do_compile=true
             )
+            sig = flatten_va_sig(sig, info.isva, info.nargs)
             raw_rule = DerivedFRule{sig,typeof(dual_oc),info.isva,info.nargs}(dual_oc)
             rule = debug_mode ? DebugFRule(raw_rule) : raw_rule
             interp.oc_cache[oc_cache_key] = rule
@@ -71,9 +123,31 @@ end
     return fwd.fwd_oc(__unflatten_dual_varargs(isva, args, Val(nargs))...)
 end
 
+# On Julia 1.10, restore type stability lost to the inferencebarrier in __call_rule by
+# asserting the return type, which is encoded in the MistyClosure type parameter.
+@static if VERSION < v"1.11-"
+    @inline function __call_rule(
+        rule::DerivedFRule{P,MistyClosure{OpaqueClosure{A,R}},isva,nargs}, args
+    ) where {P,A,R,isva,nargs}
+        return __call_rule_erased!(Base.inferencebarrier(rule), args)::R
+    end
+end
+
 # Copy forward rule with recursively copied captures
 function _copy(x::P) where {P<:DerivedFRule}
     return P(replace_captures(x.fwd_oc, _copy(x.fwd_oc.oc.captures)))
+end
+
+_isva(::DerivedFRule{P,T,isva,nargs}) where {P,T,isva,nargs} = isva
+_nargs(::DerivedFRule{P,T,isva,nargs}) where {P,T,isva,nargs} = nargs
+
+# Extends functionality defined in debug_mode.jl.
+function verify_args(r::DerivedFRule{sig}, x) where {sig}
+    Tx = Tuple{
+        map(_typeof ∘ primal, __unflatten_dual_varargs(_isva(r), x, Val(_nargs(r))))...
+    }
+    Tx <: sig && return nothing
+    throw(ArgumentError("Arguments with sig $Tx do not subtype rule signature, $sig"))
 end
 
 """
@@ -101,7 +175,11 @@ struct DualInfo
 end
 
 function generate_dual_ir(
-    interp::MooncakeInterpreter, sig_or_mi; debug_mode=false, do_inline=true
+    interp::MooncakeInterpreter,
+    sig_or_mi;
+    debug_mode=false,
+    do_inline=true,
+    do_optimize=true,
 )
     # Reset id count. This ensures that the IDs generated are the same each time this
     # function runs.
@@ -109,11 +187,34 @@ function generate_dual_ir(
 
     # Grab code associated to the primal.
     primal_ir, _ = lookup_ir(interp, sig_or_mi)
+    @static if VERSION > v"1.12-"
+        # Pin to one world so verify_ir's GlobalRef check passes; see `set_valid_world!`.
+        primal_ir = set_valid_world!(primal_ir, interp.world)
+    end
     nargs = length(primal_ir.argtypes)
+    # Match frule_type before normalisation can refine invoke return types.
+    Treturn = dual_ret_type(primal_ir)
+
+    # Reject before normalise! runs: Julia 1.12+ lowers non-const global writes
+    # (`global x = y`) to Base.setglobal! on 1.12 and Core.setglobal! on 1.13+. CC.verify_ir
+    # accepts these calls, so without this check the failure surfaces as a missing frule!!.
+    @static if VERSION > v"1.12-"
+        setglobal_calls = (GlobalRef(Base, :setglobal!), GlobalRef(Core, :setglobal!))
+        for inst in stmt(primal_ir.stmts)
+            if Meta.isexpr(inst, :call) && inst.args[1] in setglobal_calls
+                unhandled_feature(
+                    "Mooncake.jl does not support differentiating code that assigns to " *
+                    "non-const global variables. Pass the state explicitly, return the " *
+                    "updated value, or provide a custom frule!!. See the Known Limitations " *
+                    "documentation for more context.",
+                )
+            end
+        end
+    end
 
     # Normalise the IR.
     isva, spnames = is_vararg_and_sparam_names(sig_or_mi)
-    primal_ir = normalise!(primal_ir, spnames)
+    primal_ir = normalise!(primal_ir, spnames; preserve_gc=true)
 
     # Keep a copy of the primal IR with the insertions
     dual_ir = CC.copy(primal_ir)
@@ -150,9 +251,10 @@ function generate_dual_ir(
     captures_tuple = (captures...,)
     dual_ir.argtypes[1] = _typeof(captures_tuple)
 
-    # Optimize dual IR
-    dual_ir_opt = optimise_ir!(dual_ir; do_inline)
-    return dual_ir_opt, captures_tuple, DualRuleInfo(isva, nargs, dual_ret_type(primal_ir))
+    # Inspection tools need the pre-optimization dual IR, while the AD pipeline still
+    # wants the optimized form by default.
+    dual_ir = do_optimize ? optimise_ir!(dual_ir; do_inline) : dual_ir
+    return dual_ir, captures_tuple, DualRuleInfo(isva, nargs, Treturn)
 end
 
 @inline get_capture(captures::T, n::Int) where {T} = captures[n]
@@ -231,8 +333,14 @@ function modify_fwd_ad_stmts!(
     end
 
     # stmt is a const, so we have to turn it into a dual.
-    dual_stmt = ReturnNode(const_dual!(captures, stmt.val))
-    Mooncake.replace_call!(dual_ir, ssa, dual_stmt)
+    d = const_dual!(captures, stmt.val)
+    if d isa Int
+        get_dual = Expr(:call, get_capture, Argument(1), d)
+        get_dual_ssa = CC.insert_node!(dual_ir, ssa, new_inst(get_dual), ATTACH_BEFORE)
+        Mooncake.replace_call!(dual_ir, ssa, ReturnNode(get_dual_ssa))
+    else
+        Mooncake.replace_call!(dual_ir, ssa, ReturnNode(d))
+    end
     return nothing
 end
 
@@ -300,17 +408,28 @@ __get_primal(x::Dual) = primal(x)
 function modify_fwd_ad_stmts!(
     stmt::Expr, dual_ir::IRCode, ssa::SSAValue, captures::Vector{Any}, info::DualInfo
 )
-    if isexpr(stmt, :invoke) || isexpr(stmt, :call)
+    if isexpr(stmt, :gc_preserve_begin) || isexpr(stmt, :gc_preserve_end)
+        # Forward AD inserts a captures argument before the original arguments.
+        # Without shifting its argument references, gc_preserve_begin would preserve
+        # the wrong values. inc_args shifts them by one to refer to the intended Duals.
+        # gc_preserve_end refers to the result of its matching begin, not an argument
+        # position, so inc_args leaves that reference unchanged. See PR #1305.
+        replace_call!(dual_ir, ssa, inc_args(stmt))
+    elseif isexpr(stmt, :invoke) || isexpr(stmt, :call)
         raw_args = isexpr(stmt, :invoke) ? stmt.args[2:end] : stmt.args
         sig_types = map(raw_args) do x
-            return CC.widenconst(get_forward_primal_type(info.primal_ir, x))
+            t = CC.widenconst(get_forward_primal_type(info.primal_ir, x))
+            # Replace types containing Union{} (unreachable code/failed inference)
+            # with Any. This allows the code to proceed; is_primitive will return
+            # false and we'll use dynamic rules that resolve types at runtime.
+            return contains_bottom_type(t) ? Any : t
         end
         sig = Tuple{sig_types...}
-        mi = isexpr(stmt, :invoke) ? stmt.args[1] : missing
+        mi = isexpr(stmt, :invoke) ? get_mi(stmt.args[1]) : missing
         args = map(__inc, raw_args)
 
         # Special case: if the result of a call to getfield is un-used, then leave the
-        # primal statment alone (just increment arguments as usual). This was causing
+        # primal statement alone (just increment arguments as usual). This was causing
         # performance problems in a couple of situations where the field being requested is
         # not known at compile time. `getfield` cannot be dead-code eliminated, because it
         # can throw an error if the requested field does not exist. Everything _other_ than
@@ -331,11 +450,26 @@ function modify_fwd_ad_stmts!(
             return uninit_dual(get_const_primal_value(arg))
         end
 
-        if is_primitive(context_type(info.interp), ForwardMode, sig)
-            replace_call!(dual_ir, ssa, Expr(:call, frule!!, dual_args...))
+        interp = info.interp
+        if is_primitive(context_type(interp), ForwardMode, sig, interp.world)
+            rule = build_primitive_frule(sig)
+            if safe_for_literal(rule)
+                replace_call!(dual_ir, ssa, Expr(:call, rule, dual_args...))
+            else
+                push!(captures, rule)
+                get_rule = Expr(:call, get_capture, Argument(1), length(captures))
+                rule_ssa = CC.insert_node!(dual_ir, ssa, new_inst(get_rule), ATTACH_BEFORE)
+                replace_call!(dual_ir, ssa, Expr(:call, rule_ssa, dual_args...))
+            end
         else
             dm = info.debug_mode
-            push!(captures, isexpr(stmt, :invoke) ? LazyFRule(mi, dm) : DynamicFRule(dm))
+            # Predict at the world this transform runs in: inside a pinned rebuild
+            # (`_build_rule!`) the current world is later, which would reintroduce the
+            # `Trule` mismatch of #1218 one level down.
+            w = interp.world
+            push!(
+                captures, isexpr(stmt, :invoke) ? LazyFRule(mi, dm, w) : DynamicFRule(dm, w)
+            )
             get_rule = Expr(:call, get_capture, Argument(1), length(captures))
             rule_ssa = CC.insert_node!(dual_ir, ssa, new_inst(get_rule), ATTACH_BEFORE)
             replace_call!(dual_ir, ssa, Expr(:call, rule_ssa, dual_args...))
@@ -351,7 +485,7 @@ function modify_fwd_ad_stmts!(
         new_copyast_inst = CC.NewInstruction(get_ir(info.primal_ir, ssa))
         new_copyast_ssa = CC.insert_node!(dual_ir, ssa, new_copyast_inst, ATTACH_BEFORE)
         replace_call!(dual_ir, ssa, Expr(:call, zero_dual, new_copyast_ssa))
-    elseif Meta.isexpr(stmt, :loopinfo)
+    elseif Meta.isexpr(stmt, :loopinfo) || Meta.isexpr(stmt, :meta)
         # Leave this node alone.
     elseif isexpr(stmt, :throw_undef_if_not)
         # args[1] is a Symbol, args[2] is the condition which must be primalized
@@ -387,69 +521,106 @@ end
 mutable struct LazyFRule{primal_sig,Trule}
     debug_mode::Bool
     mi::Core.MethodInstance
+    world::UInt
     rule::Trule
-    function LazyFRule(mi::Core.MethodInstance, debug_mode::Bool)
-        interp = get_interpreter(ForwardMode)
-        return new{mi.specTypes,frule_type(interp, mi;debug_mode)}(debug_mode, mi)
+    function LazyFRule(mi::Core.MethodInstance, debug_mode::Bool, world::UInt)
+        interp = get_interpreter(ForwardMode, world)
+        return new{mi.specTypes,frule_type(interp, mi;debug_mode)}(debug_mode, mi, world)
     end
     function LazyFRule{Tprimal_sig,Trule}(
-        mi::Core.MethodInstance, debug_mode::Bool
+        mi::Core.MethodInstance, debug_mode::Bool, world::UInt
     ) where {Tprimal_sig,Trule}
-        return new{Tprimal_sig,Trule}(debug_mode, mi)
+        return new{Tprimal_sig,Trule}(debug_mode, mi, world)
     end
 end
 
-# Create new lazy rule with same method instance and debug mode
-_copy(x::P) where {P<:LazyFRule} = P(x.mi, x.debug_mode)
+_copy(x::P) where {P<:LazyFRule} = P(x.mi, x.debug_mode, x.world)
 
-@inline function (rule::LazyFRule)(args::Vararg{Any,N}) where {N}
-    return isdefined(rule, :rule) ? rule.rule(args...) : _build_rule!(rule, args)
+# On Julia 1.10, the generic __call_rule fallback is @stable-checked and returns Any for
+# LazyFRule, triggering TypeInstabilityError when dispatch_doctor_mode = "error".
+# Add type-asserting specialisations so callers in @stable contexts see a concrete type.
+# LazyFRule doesn't contain an OpaqueClosure directly, so no inferencebarrier needed.
+@static if VERSION < v"1.11-"
+    @inline function __call_rule(
+        rule::LazyFRule{sig,DerivedFRule{P,MistyClosure{OpaqueClosure{A,R}},isva,nargs}},
+        args,
+    ) where {sig,P,A,R,isva,nargs}
+        return rule(args...)::R
+    end
+    @inline function __call_rule(
+        rule::LazyFRule{
+            sig,DebugFRule{DerivedFRule{P,MistyClosure{OpaqueClosure{A,R}},isva,nargs}}
+        },
+        args,
+    ) where {sig,P,A,R,isva,nargs}
+        return rule(args...)::R
+    end
 end
 
+@inline function (rule::LazyFRule)(args::Vararg{Any,N}) where {N}
+    return isdefined(rule, :rule) ? __call_rule(rule.rule, args) : _build_rule!(rule, args)
+end
+
+# Build at the world `Trule` was predicted at: a later world can re-tighten `mi`'s inferred
+# return type, giving a rule that no longer matches `Trule` and fails to `convert` (#1218).
 @noinline function _build_rule!(rule::LazyFRule{sig,Trule}, args) where {sig,Trule}
-    interp = get_interpreter(ForwardMode)
-    rule.rule = build_frule(interp, rule.mi; debug_mode=rule.debug_mode)
-    return rule.rule(args...)
+    interp = get_interpreter(ForwardMode, rule.world)
+    rule.rule = build_frule(
+        interp, rule.mi; debug_mode=rule.debug_mode, skip_world_age_check=true
+    )
+    return __call_rule(rule.rule, args)
 end
 
 function dual_ret_type(primal_ir::IRCode)
-    return dual_type(Base.Experimental.compute_ir_rettype(primal_ir))
+    return dual_type(compute_ir_rettype(primal_ir))
 end
 
 function frule_type(
     interp::MooncakeInterpreter{C}, mi::CC.MethodInstance; debug_mode
 ) where {C}
-    primal_sig = _get_sig(mi)
-    if is_primitive(C, ForwardMode, primal_sig)
-        return debug_mode ? DebugFRule{typeof(frule!!)} : typeof(frule!!)
+    sig = _get_sig(mi)
+    if is_primitive(C, ForwardMode, sig, interp.world)
+        # Build the rule to obtain its concrete type. For non-singleton primitive rules
+        # (e.g. NfwdMooncake.Rule) this allocates a throwaway instance; the cost is compile-
+        # time only and does not affect hot-path performance.
+        rule = build_primitive_frule(sig)
+        return debug_mode ? DebugFRule{typeof(rule)} : typeof(rule)
     end
     ir, _ = lookup_ir(interp, mi)
     nargs = length(ir.argtypes)
     isva, _ = is_vararg_and_sparam_names(mi)
     arg_types = map(CC.widenconst, ir.argtypes)
+    sig = Tuple{arg_types...}
     dual_args_type = Tuple{map(dual_type, arg_types)...}
     closure_type = RuleMC{dual_args_type,dual_ret_type(ir)}
-    Tderived_rule = DerivedFRule{primal_sig,closure_type,isva,nargs}
+    Tderived_rule = DerivedFRule{sig,closure_type,isva,nargs}
     return debug_mode ? DebugFRule{Tderived_rule} : Tderived_rule
 end
 
 struct DynamicFRule{V}
     cache::V
     debug_mode::Bool
+    world::UInt
 end
 
-DynamicFRule(debug_mode::Bool) = DynamicFRule(Dict{Any,Any}(), debug_mode)
+function DynamicFRule(debug_mode::Bool, world::UInt)
+    return DynamicFRule(Dict{Any,Any}(), debug_mode, world)
+end
 
-# Create new dynamic rule with empty cache and same debug mode  
-_copy(x::P) where {P<:DynamicFRule} = P(Dict{Any,Any}(), x.debug_mode)
+_copy(x::P) where {P<:DynamicFRule} = P(Dict{Any,Any}(), x.debug_mode, x.world)
 
 function (dynamic_rule::DynamicFRule)(args::Vararg{Dual,N}) where {N}
-    sig = Tuple{map(_typeof ∘ primal, args)...}
+    # `Base._stable_typeof` must be used here, rather than `typeof` or `Mooncake._typeof`.
+    # See DynamicDerivedRule for details, the same reasoning applies.
+    sig = Tuple{map(Base._stable_typeof ∘ primal, args)...}
     rule = get(dynamic_rule.cache, sig, nothing)
     if rule === nothing
-        interp = get_interpreter(ForwardMode)
-        rule = build_frule(interp, sig; debug_mode=dynamic_rule.debug_mode)
+        # Build at this rule's creation world, not the current one; see _build_rule! (#1218)
+        interp = get_interpreter(ForwardMode, dynamic_rule.world)
+        rule = build_frule(
+            interp, sig; debug_mode=dynamic_rule.debug_mode, skip_world_age_check=true
+        )
         dynamic_rule.cache[sig] = rule
     end
-    return rule(args...)
+    return __call_rule(rule, args)
 end

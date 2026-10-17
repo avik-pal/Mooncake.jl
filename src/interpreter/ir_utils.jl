@@ -1,3 +1,104 @@
+#
+# Shared IR primitives, used by both modes and by `ir_utils` itself. They live here, not with
+# the reverse-mode working IR in `reverse_mode.jl`, because both mode files are loaded after
+# this one.
+#
+
+const _id_count::Dict{Int,Int32} = Dict{Int,Int32}()
+
+"""
+    ID()
+
+An `ID` (read: unique name) is just a wrapper around an `Int32`. Uniqueness is ensured via a
+global counter, which is incremented each time that an `ID` is created.
+
+This counter can be reset using `seed_id!` if you need to ensure deterministic `ID`s are
+produced, in the same way that seed for random number generators can be set.
+"""
+struct ID
+    id::Int32
+    function ID()
+        current_thread_id = Threads.threadid()
+        id_count = get(_id_count, current_thread_id, Int32(0))
+        _id_count[current_thread_id] = id_count + Int32(1)
+        return new(id_count)
+    end
+end
+
+Base.copy(id::ID) = id
+
+"""
+    seed_id!()
+
+Set the global counter used to ensure ID uniqueness to 0. This is useful when you want to
+ensure determinism between two runs of the same function which makes use of `ID`s.
+
+This is akin to setting the random seed associated to a random number generator globally.
+"""
+function seed_id!()
+    return global _id_count[Threads.threadid()] = 0
+end
+
+"""
+    const InstVector = Vector{NewInstruction}
+
+Note: the `CC.NewInstruction` type is used to represent instructions because it has the
+correct fields. While it is only used to represent new instructions in `Core.Compiler`, it
+is used to represent all instructions in the working-IR layer.
+"""
+const InstVector = Vector{NewInstruction}
+
+"""
+    new_inst(stmt, type=Any, flag=CC.IR_FLAG_REFINED; noinline=false)::NewInstruction
+
+Create a `NewInstruction` with fields:
+- `stmt` = `stmt`
+- `type` = `type`
+- `info` = `CC.NoCallInfo()`
+- `line` = `Int32(1)`
+- `flag` = `flag`, with `CC.IR_FLAG_NOINLINE` added when `noinline=true`
+"""
+function new_inst(
+    @nospecialize(stmt),
+    @nospecialize(type)=Any,
+    flag=CC.IR_FLAG_REFINED;
+    noinline::Bool=false,
+)
+    noinline && (flag |= CC.IR_FLAG_NOINLINE)
+    return NewInstruction(stmt, type, CC.NoCallInfo(), Int32(1), flag)
+end
+
+"""
+    __line_numbers_to_block_numbers!(insts::Vector{Any}, cfg::CC.CFG)
+
+Converts any edges in `GotoNode`s, `GotoIfNot`s, `PhiNode`s, and `:enter` expressions which
+refer to line numbers into references to block numbers. The `cfg` provides the information
+required to perform this conversion.
+
+For context, `CodeInfo` objects have references to line numbers, while `IRCode` uses
+block numbers.
+
+This code is copied over directly from the body of `Core.Compiler.inflate_ir!`.
+"""
+function __line_numbers_to_block_numbers!(insts::Vector{Any}, cfg::CC.CFG)
+    for i in eachindex(insts)
+        stmt = insts[i]
+        if isa(stmt, GotoNode)
+            insts[i] = GotoNode(CC.block_for_inst(cfg, stmt.label))
+        elseif isa(stmt, GotoIfNot)
+            insts[i] = GotoIfNot(stmt.cond, CC.block_for_inst(cfg, stmt.dest))
+        elseif isa(stmt, PhiNode)
+            insts[i] = PhiNode(
+                Int32[CC.block_for_inst(cfg, Int(edge)) for edge in stmt.edges], stmt.values
+            )
+        elseif Meta.isexpr(stmt, :enter)
+            stmt.args[1] = CC.block_for_inst(cfg, stmt.args[1]::Int)
+            insts[i] = stmt
+        end
+    end
+    return insts
+end
+
 stmt_field_name() = @static VERSION < v"1.11" ? :inst : :stmt
 
 """
@@ -59,7 +160,11 @@ function ircode(
     cfg = CC.compute_basic_blocks(insts)
     insts = __line_numbers_to_block_numbers!(insts, cfg)
     stmts = __insts_to_instruction_stream(insts)
-    linetable = [CC.LineInfoNode(Mooncake, :ircode, :ir_utils, Int32(1), Int32(0))]
+    @static if VERSION > v"1.12-"
+        linetable = CC.DebugInfoStream(nothing, CC.DebugInfo(:Mooncake), length(insts))
+    else
+        linetable = [CC.LineInfoNode(Mooncake, :ircode, :ir_utils, Int32(1), Int32(0))]
+    end
     meta = Expr[]
     return CC.IRCode(stmts, cfg, linetable, argtypes, meta, CC.VarState[])
 end
@@ -78,12 +183,21 @@ As such, if you wish to ensure that your `IRCode` prints nicely, you should ensu
 linetable field has at least one element.
 """
 function __insts_to_instruction_stream(insts::Vector{Any})
+    n = length(insts)
+    @static if VERSION > v"1.12-"
+        lineinfo = Int32[]
+        for _ in 1:n
+            push!(lineinfo, 1, 0, 0)
+        end
+    else
+        lineinfo = ones(Int32, n)
+    end
     return CC.InstructionStream(
         insts,
-        fill(Any, length(insts)),
-        fill(CC.NoCallInfo(), length(insts)),
-        fill(Int32(1), length(insts)),
-        fill(CC.IR_FLAG_REFINED, length(insts)),
+        Any[Any for _ in 1:n],
+        CC.CallInfo[CC.NoCallInfo() for _ in 1:n],
+        lineinfo,
+        fill(CC.IR_FLAG_REFINED, n),
     )
 end
 
@@ -115,18 +229,33 @@ end
 # Run type inference and constant propagation on the ir. Credit to @oxinabox:
 # https://gist.github.com/oxinabox/cdcffc1392f91a2f6d80b2524726d802#file-example-jl-L54
 function __infer_ir!(ir, interp::CC.AbstractInterpreter, mi::CC.MethodInstance)
-    method_info = CC.MethodInfo(true, nothing)#=propagate_inbounds=#
-    min_world = world = get_inference_world(interp)
-    max_world = Base.get_world_counter()
-    irsv = CC.IRInterpretationState(
-        interp, method_info, ir, mi, ir.argtypes, world, min_world, max_world
-    )
-    rt = CC._ir_abstract_constant_propagation(interp, irsv)
+    @static if VERSION >= v"1.12-"
+        nargs = length(ir.argtypes) - 1
+        # For now, we always set isva to false, as it doesn't seem to be used
+        # by inference. In the future we could pass it from the callsites of
+        # optimise_ir! down to here if needed.
+        isva = false
+        propagate_inbounds = true
+        spec_info = CC.SpecInfo(nargs, isva, propagate_inbounds, nothing)
+        max_world = min_world = world = get_inference_world(interp)
+        irsv = CC.IRInterpretationState(
+            interp, spec_info, ir, mi, ir.argtypes, world, min_world, max_world
+        )
+        rt = CC.ir_abstract_constant_propagation(interp, irsv)
+    else
+        method_info = CC.MethodInfo(true, nothing)#=propagate_inbounds=#
+        min_world = world = get_inference_world(interp)
+        max_world = Base.get_world_counter()
+        irsv = CC.IRInterpretationState(
+            interp, method_info, ir, mi, ir.argtypes, world, min_world, max_world
+        )
+        rt = CC._ir_abstract_constant_propagation(interp, irsv)
+    end
     return ir
 end
 
 # In automatically generated code, it is meaningless to include code coverage effects.
-# Moreover, it seems to cause some serious inference probems. Consequently, it makes sense
+# Moreover, it seems to cause some serious inference problems. Consequently, it makes sense
 # to remove such effects before optimising IRCode.
 function __strip_coverage!(ir::IRCode)
     for n in eachindex(stmt(ir.stmts))
@@ -143,7 +272,7 @@ end
 Run a fairly standard optimisation pass on `ir`. If `show_ir` is `true`, displays the IR
 to `stdout` at various points in the pipeline -- this is sometimes useful for debugging.
 """
-function optimise_ir!(ir::IRCode; show_ir=false, do_inline=true)
+function optimise_ir!(ir::IRCode; show_ir=false, do_inline=true, interp=nothing)
     if show_ir
         println("Pre-optimization")
         display(ir)
@@ -152,10 +281,15 @@ function optimise_ir!(ir::IRCode; show_ir=false, do_inline=true)
     CC.verify_ir(ir)
     ir = __strip_coverage!(ir)
     ir = CC.compact!(ir)
-    # local_interp = CC.NativeInterpreter()
-    local_interp = BugPatchInterpreter() # 319 -- see patch_for_319.jl for context
+    @static if VERSION ≥ v"1.13-"
+        infer_interp = CC.NativeInterpreter()
+    else
+        # 319 -- see patch_for_319.jl for context
+        infer_interp = BugPatchInterpreter()
+    end
+    local_interp = isnothing(interp) ? infer_interp : interp
     mi = __get_toplevel_mi_from_ir(ir, @__MODULE__)
-    ir = __infer_ir!(ir, local_interp, mi)
+    ir = __infer_ir!(ir, infer_interp, mi)
     if show_ir
         println("Post-inference")
         display(ir)
@@ -178,7 +312,11 @@ function optimise_ir!(ir::IRCode; show_ir=false, do_inline=true)
 
     ir = CC.compact!(ir)
     # CC.verify_ir(ir, true, false, CC.optimizer_lattice(local_interp))
-    CC.verify_linetable(ir.linetable, true)
+    @static if VERSION > v"1.12-"
+        CC.verify_linetable(ir.debuginfo, length(ir.stmts), true)
+    else
+        CC.verify_linetable(ir.linetable, true)
+    end
     if show_ir
         println("Post-optimization")
         display(ir)
@@ -253,6 +391,42 @@ function lookup_ir(::CC.AbstractInterpreter, mc::MistyClosure; optimize_until=no
     return mc.ir[], return_type(mc.oc)
 end
 
+@static if VERSION > v"1.12-"
+    """
+        set_valid_world!(ir::IRCode, world::UInt)::IRCode
+
+    (1.12+ only)
+    Create a shallow copy of the given IR code, with its `valid_worlds` field updated
+    to a single valid world. This allows the compiler to perform more inlining.
+
+    In particular, if the IR comes from say a function `f` which makes a call to another
+    function `g` which only got defined after `f`, then at the min_world when `f` was
+    defined, `g` was not available yet. If we restrict the IR to a world where `g` is
+    available then `g` can be inlined.
+
+    Pinning to a single world is also a precondition for `normalise!`: it lets
+    `CC.verify_ir`'s partitioned-binding const check accept the IR's GlobalRefs without
+    rewriting them. This is why every rule-build entry point calls `set_valid_world!`
+    immediately after `lookup_ir`, before `normalise!`.
+
+    Will error if `world` is not in the existing `valid_worlds` of `ir`.
+    """
+    function set_valid_world!(ir::IRCode, world::UInt)
+        if world ∉ ir.valid_worlds
+            error("World $world is not valid for this IRCode: $(ir.valid_worlds).")
+        end
+        return CC.IRCode(
+            ir.stmts,
+            ir.cfg,
+            ir.debuginfo,
+            ir.argtypes,
+            ir.meta,
+            ir.sptypes,
+            CC.WorldRange(world, world),
+        )
+    end
+end
+
 return_type(::Core.OpaqueClosure{A,B}) where {A,B} = B
 
 """
@@ -290,10 +464,10 @@ function in `ir_normalisation.jl`. You probably do not want to use it.
 """
 function replace_uses_with!(stmt, def::Union{Argument,SSAValue}, val)
     if stmt isa Expr
-        stmt.args = Any[arg == def ? val : arg for arg in stmt.args]
+        stmt.args = Any[arg === def ? val : arg for arg in stmt.args]
         return stmt
     elseif stmt isa GotoIfNot
-        if stmt.cond == def
+        if stmt.cond === def
             @assert val isa Bool
             return GotoIfNot(val, stmt.dest)
         else

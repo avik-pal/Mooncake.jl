@@ -26,54 +26,57 @@ jobs:
       fail-fast: false
       matrix:
         test_group: [
-          'quality',
           'basic',
-          'rrules/avoiding_non_differentiable_code',
-          'rrules/blas',
-          'rrules/builtins',
-          'rrules/dispatch_doctor',
-          'rrules/fastmath',
-          'rrules/foreigncall',
-          'rrules/functionwrappers',
-          'rrules/iddict',
-          'rrules/lapack',
-          'rrules/linear_algebra',
-          'rrules/low_level_maths',
-          'rrules/memory',
-          'rrules/misc',
-          'rrules/misty_closures',
-          'rrules/new',
-          'rrules/random',
-          'rrules/tasks',
-          'rrules/twice_precision',
-          'rrules/performance_patches',
+          'Nfwd',
+          'rules/avoiding_non_differentiable_code',
+          'rules/blas_Float64',
+          'rules/blas_Float32',
+          'rules/blas_ComplexF64',
+          'rules/blas_ComplexF32',
+          'rules/builtins',
+          'rules/complex',
+          'rules/dispatch_doctor',
+          'rules/fastmath',
+          'rules/foreigncall',
+          'rules/iddict',
+          'rules/lapack',
+          'rules/linear_algebra',
+          'rules/low_level_maths',
+          'rules/memory',
+          'rules/misc',
+          'rules/misty_closures',
+          'rules/new',
+          'rules/random',
+          'rules/tasks',
+          'rules/twice_precision',
+          'rules/performance_patches',
+          'rules/high_order_derivative_patches',
         ]
         version:
           - 'lts'
-          - '1'
+          - '1.13'
         arch:
           - x64
         include:
           - test_group: 'basic'
             version: 'lts'
             arch: x86
-          - test_group: 'rrules/array_legacy'
+          - test_group: 'rules/array_legacy'
             version: 'lts'
             arch: x64
     steps:
-      - uses: actions/checkout@v5
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-          include-all-prereleases: false
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         env:
           TEST_GROUP: ${{ matrix.test_group }}
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -89,9 +92,13 @@ jobs:
           {test_type: 'ext', label: 'differentiation_interface'},
           {test_type: 'ext', label: 'dynamic_expressions'},
           {test_type: 'ext', label: 'flux'},
+          {test_type: 'ext', label: 'function_wrappers'},
           {test_type: 'ext', label: 'luxlib'},
           {test_type: 'ext', label: 'nnlib'},
+          {test_type: 'ext', label: 'bfloat16s'},
+          {test_type: 'ext', label: 'distances'},
           {test_type: 'ext', label: 'special_functions'},
+          {test_type: 'ext', label: 'logexpfunctions'},
           {test_type: 'integration_testing', label: 'array'},
           {test_type: 'integration_testing', label: 'bijectors'},
           {test_type: 'integration_testing', label: 'diff_tests'},
@@ -100,30 +107,32 @@ jobs:
           {test_type: 'integration_testing', label: 'distributions'},
           {test_type: 'integration_testing', label: 'dynamicppl'},
           {test_type: 'integration_testing', label: 'gp'},
-          {test_type: 'integration_testing', label: 'logexpfunctions'},
-          {test_type: 'integration_testing', label: 'lux'},
           {test_type: 'integration_testing', label: 'battery_tests'},
           {test_type: 'integration_testing', label: 'misc_abstract_array'},
           {test_type: 'integration_testing', label: 'temporalgps'},
-          {test_type: 'integration_testing', label: 'flux'},
         ]
         version:
-          - '1'
           - 'lts'
+          - '1.13'
         arch:
           - x64
+        include:
+          - test_group: { test_type: 'integration_testing', label: 'format' }
+            version: 'lts'
+            arch: x64
     steps:
-      - uses: actions/checkout@v5
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-          include-all-prereleases: false
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - run: |
           if [ ${{ matrix.test_group.test_type }} == 'ext' ]; then
             julia --code-coverage=user --eval 'include("test/run_extra.jl")'
+          elif [ "$LABEL" == 'diff_tests' ]; then
+            julia --heap-size-hint=32M --eval 'include("test/run_extra.jl")'
           else
             julia --eval 'include("test/run_extra.jl")'
           fi
@@ -131,7 +140,7 @@ jobs:
           LABEL: ${{ matrix.test_group.label }}
           TEST_TYPE: ${{ matrix.test_group.test_type }}
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -146,13 +155,13 @@ jobs:
           - 'hand_written'
           - 'derived'
     steps:
-      - uses: actions/checkout@v5
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
-          version: '1'
+          version: '1.13'
           arch: x64
           include-all-prereleases: false
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - run: julia --project=bench --eval 'include("bench/run_benchmarks.jl"); main()'
         env:
@@ -165,13 +174,13 @@ jobs:
     strategy:
       fail-fast: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
-          version: '1'
+          version: '1.13'
           arch: x64
           include-all-prereleases: false
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - run: mkdir bench_results
       - run: julia --project=bench --eval 'include("bench/run_benchmarks.jl"); main()'
@@ -179,16 +188,10 @@ jobs:
           PERF_GROUP: 'comparison'
           GKSwstype: '100'
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: benchmarking-results
           path: bench_results/
-      # Useful code for testing action.
-      # - run: |
-      #     text="this is line one
-      #     this is line two
-      #     this is line three"
-      #     echo "$text" > benchmark_results.txt
       - name: Read file content
         id: read-file
         run: |
@@ -197,27 +200,13 @@ jobs:
             cat bench/benchmark_results.txt
             echo "EOF"
           } >> $GITHUB_OUTPUT
-          
-      - name: Find Comment
-        uses: peter-evans/find-comment@v3
-        id: fc
+      - name: Sync PR summary
+        uses: TuringLang/actions/SyncPRSummary@main
         with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: github-actions[bot]
-          body-includes: "perf-results"
-
-      - id: post-report-as-pr-comment
-        name: Post Report as Pull Request Comment
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            <!-- perf-results -->
+          perf-content: |
             Performance Ratio:
             Ratio of time to compute gradient and time to compute function.
             Warning: results are very approximate! See [here](https://github.com/chalk-lab/Mooncake.jl/tree/main/bench#inter-framework-benchmarking) for more context.
             ```
             ${{ steps.read-file.outputs.table }}
             ```
-          comment-id: ${{ steps.fc.outputs.comment-id }}
-          edit-mode: replace

@@ -87,7 +87,7 @@ interfaces that this package defines have been implemented correctly.
 """
 module TestUtils
 
-using Random, Mooncake, Test, InteractiveUtils
+using Random, Mooncake, Test
 using Mooncake:
     CoDual,
     NoTangent,
@@ -96,6 +96,7 @@ using Mooncake:
     MutableTangent,
     frule!!,
     rrule!!,
+    DebugFRule,
     build_rrule,
     tangent_type,
     zero_tangent,
@@ -139,10 +140,11 @@ using Mooncake:
     CC,
     set_to_zero!!,
     increment!!,
+    normalize_tangent,
     randn_tangent,
     _scale,
     _add_to_primal,
-    _diff,
+    primal_to_tangent!!,
     _dot,
     NoFData,
     fdata_type,
@@ -199,41 +201,47 @@ that takes an additional `visited` dictionary to track visited objects and avoid
 recursion in cases of circular references.
 """
 function has_equal_data(x, y; equal_undefs=true)
-    return has_equal_data_internal(x, y, equal_undefs, Dict{Tuple{UInt,UInt},Bool}())
+    return has_equal_data_internal(x, y, equal_undefs, IdDict{Any,Bool}())
 end
 
-function has_equal_data_internal(
-    x::Type, y::Type, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
-)
+function has_equal_data_internal(x::Type, y::Type, equal_undefs::Bool, d::IdDict{Any,Bool})
     return x == y
 end
 function has_equal_data_internal(
-    x::T, y::T, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::T, y::T, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {T<:String}
     return x == y
 end
 function has_equal_data_internal(
-    x::Core.TypeName, y::Core.TypeName, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::Core.TypeName, y::Core.TypeName, equal_undefs::Bool, d::IdDict{Any,Bool}
 )
     return x == y
 end
 function has_equal_data_internal(
-    x::P, y::P, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::P, y::P, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {P<:Base.IEEEFloat}
-    return (isapprox(x, y) && !isnan(x)) || (isnan(x) && isnan(y))
+    # Pass an atol such that we can compare approximately against 0 values.
+    return isapprox(x, y; atol=(√eps(P)), nans=true)
 end
 function has_equal_data_internal(
-    x::Module, y::Module, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::Module, y::Module, equal_undefs::Bool, d::IdDict{Any,Bool}
 )
     return x == y
 end
+# `Symbol` is neither primitive nor has fields, so the generic method below descends into
+# nothing and reports every pair as equal.
 function has_equal_data_internal(
-    x::GlobalRef, y::GlobalRef; equal_undefs=true, d::Dict{Tuple{UInt,UInt},Bool}
+    x::Symbol, y::Symbol, equal_undefs::Bool, d::IdDict{Any,Bool}
+)
+    return x === y
+end
+function has_equal_data_internal(
+    x::GlobalRef, y::GlobalRef, equal_undefs::Bool, d::IdDict{Any,Bool}
 )
     return x.mod == y.mod && x.name == y.name
 end
 function has_equal_data_internal(
-    x::T, y::T, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::T, y::T, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {T<:Array}
     size(x) != size(y) && return false
 
@@ -249,7 +257,7 @@ function has_equal_data_internal(
     # - We consider "circular references to itself" as equal data for this subcomponent.
     # - However, other parts of x and y may still differ, so we continue checking.
 
-    id_pair = (objectid(x), objectid(y))
+    id_pair = (x, y)
     if haskey(d, id_pair)
         return d[id_pair]
     end
@@ -267,16 +275,27 @@ function has_equal_data_internal(
     return all(equality)
 end
 function has_equal_data_internal(
-    x::T, y::T, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::T, y::T, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {T<:Core.SimpleVector}
     return all(map((a, b) -> has_equal_data_internal(a, b, equal_undefs, d), x, y))
 end
+
+# `Method`, `CodeInstance` and `MethodInstance` reference one another, so field descent
+# walks the runtime's method graph and overflows the stack.
+for T in (:(Core.Method), :(Core.CodeInstance), :(Core.MethodInstance))
+    @eval function has_equal_data_internal(
+        x::$T, y::$T, equal_undefs::Bool, d::IdDict{Any,Bool}
+    )
+        return x == y
+    end
+end
+
 function has_equal_data_internal(
-    x::T, y::T, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::T, y::T, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {T}
     isprimitivetype(T) && return isequal(x, y)
 
-    id_pair = (objectid(x), objectid(y))
+    id_pair = (x, y)
     if haskey(d, id_pair)
         return d[id_pair]
     end
@@ -313,12 +332,12 @@ function has_equal_data_internal(
     end
 end
 function has_equal_data_internal(
-    x::T, y::P, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::T, y::P, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {T,P}
     return false
 end
 function has_equal_data_internal(
-    x::T, y::T, equal_undefs::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::T, y::T, equal_undefs::Bool, d::IdDict{Any,Bool}
 ) where {T<:Dict}
     f(x, y) = has_equal_data_internal(x, y, equal_undefs, d)
     return length(x) == length(y) &&
@@ -351,11 +370,17 @@ function populate_address_map_internal(m::AddressMap, primal::P, tangent::T) whe
     T === NoTangent && return m
     T === NoFData && return m
     if ismutabletype(P)
-        @assert T <: MutableTangent
+        @assert T <: MutableTangent "Expected tangent type to be a MutableTangent for mutable primal type $(P), but got $(T)."
         k = pointer_from_objref(primal)
         v = pointer_from_objref(tangent)
         if haskey(m, k)
-            @assert m[k] == v
+            @assert(
+                m[k] == v,
+                "Aliasing not preserved: primal object at address $(k) maps to tangent " *
+                    "at address $(m[k]), but also maps to a different tangent at address $(v). " *
+                    "This means two references to the same primal object do not share the " *
+                    "same tangent object.",
+            )
             return m
         end
         m[k] = v
@@ -391,7 +416,13 @@ function populate_address_map_internal(m::AddressMap, p::Array, t::Array)
     k = pointer_from_objref(p)
     v = pointer_from_objref(t)
     if haskey(m, k)
-        @assert m[k] == v
+        @assert(
+            m[k] == v,
+            "Aliasing not preserved: primal Array at address $(k) maps to tangent " *
+                "at address $(m[k]), but also maps to a different tangent at address $(v). " *
+                "This means two references to the same primal object do not share the " *
+                "same tangent object.",
+        )
         return m
     end
     m[k] = v
@@ -405,7 +436,13 @@ function populate_address_map_internal(m::AddressMap, p::Core.SimpleVector, t::V
     k = pointer_from_objref(p)
     v = pointer_from_objref(t)
     if haskey(m, k)
-        @assert m[k] == v
+        @assert(
+            m[k] == v,
+            "Aliasing not preserved: primal SimpleVector at address $(k) maps to " *
+                "tangent at address $(m[k]), but also maps to a different tangent at " *
+                "address $(v). This means two references to the same primal object do " *
+                "not share the same tangent object.",
+        )
         return m
     end
     m[k] = v
@@ -430,22 +467,54 @@ function address_maps_are_consistent(x::AddressMap, y::AddressMap)
     return all(map(k -> x[k] == y[k], collect(intersect(keys(x), keys(y)))))
 end
 
-# Assumes that the interface has been tested, and we can simply check for numerical issues.
-function test_frule_correctness(rng::AbstractRNG, x_ẋ...; frule, unsafe_perturb::Bool)
-    @nospecialize rng x_ẋ
+"""
+    _diff(p::P, q::P) where {P}
 
-    x_ẋ = map(_deepcopy, x_ẋ) # defensive copy
+Computes the difference between `p` and `q`, which _must_ be of the same type, `P`.
+Returns a tangent of type `tangent_type(P)`.
+"""
+function _diff(p::P, q::P) where {P}
+    t1 = zero_tangent(p)
+    t1 = primal_to_tangent!!(t1, p)
+    t2 = zero_tangent(q)
+    t2 = primal_to_tangent!!(t2, q)
+
+    return increment!!(_scale(-1.0, t2), t1)
+end
+
+# Assumes that the interface has been tested, and we can simply check for numerical issues.
+function test_frule_correctness(
+    rng::AbstractRNG,
+    x_ẋ...;
+    frule,
+    unsafe_perturb::Bool,
+    rtol=1e-3,
+    atol=1e-3,
+    max_fd_step::Union{Nothing,Real}=nothing,
+)
+    @nospecialize rng x_ẋ
+
+    x_ẋ = map(_deepcopy, x_ẋ) # defensive copy
 
     # Run original function on deep-copies of inputs.
-    x = map(primal, x_ẋ)
-    ẋ = map(tangent, x_ẋ)
+    x = map(primal, x_ẋ)
+    ẋ = map(normalize_tangent ∘ tangent, x_ẋ)
     x_primal = _deepcopy(x)
     y_primal = x_primal[1](x_primal[2:end]...)
 
-    # Use finite differences to estimate Frechet derivative. Compute the estimate at a range
+    # Use finite differences to estimate Fréchet derivative. Compute the estimate at a range
     # of different step sizes. We'll just require that one of them ends up being close to
     # what AD gives.
     ε_list = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
+    if max_fd_step !== nothing
+        ε_list = filter(≤(max_fd_step), ε_list)
+        length(ε_list) ≥ 2 || throw(
+            ArgumentError(
+                "max_fd_step=$max_fd_step leaves fewer than two FD steps; the fixed " *
+                "grid ends at 1e-7, so the smallest usable cap is 1e-6.",
+            ),
+        )
+    end
     fd_results = Vector{Any}(undef, length(ε_list))
     for (n, ε) in enumerate(ε_list)
         x′_l = _add_to_primal(x, _scale(ε, ẋ), unsafe_perturb)
@@ -458,7 +527,7 @@ function test_frule_correctness(rng::AbstractRNG, x_ẋ...; frule, unsafe_pertur
         )
     end
 
-    # Use AD to compute Frechet derivative at ẋ.
+    # Use AD to compute Fréchet derivative at ẋ.
     x_ẋ_rule = map((x, ẋ) -> dual_type(_typeof(x))(_deepcopy(x), ẋ), x, ẋ)
     inputs_address_map = populate_address_map(
         map(primal, x_ẋ_rule), map(tangent, x_ẋ_rule)
@@ -485,19 +554,26 @@ function test_frule_correctness(rng::AbstractRNG, x_ẋ...; frule, unsafe_pertur
     # such that AD and central differences agree on the answer.
     x̄ = map(Base.Fix1(randn_tangent, rng), x_primal)
     ȳ = randn_tangent(rng, y_primal)
+
+    # normalize the JVP's probe vectors to avoid random scaling of AD, FD errors.
+    x̄_normdir, ȳ_normdir = normalize_tangent(x̄), normalize_tangent(ȳ)
+
     isapprox_results = map(fd_results) do result
         ẏ_fd, ẋ_fd = result
         return isapprox(
-            _dot(ȳ, ẏ_fd) + _dot(x̄, ẋ_fd),
-            _dot(ȳ, ẏ_ad) + _dot(x̄, ẋ_ad);
-            rtol=1e-3,
-            atol=1e-3,
+            _dot(ȳ_normdir, ẏ_fd) + _dot(x̄_normdir, ẋ_fd),
+            _dot(ȳ_normdir, ẏ_ad) + _dot(x̄_normdir, ẋ_ad);
+            rtol=rtol,
+            atol=atol,
         )
     end
     if !any(isapprox_results)
         vals = map(fd_results) do result
             ẏ_fd, ẋ_fd = result
-            (_dot(ȳ, ẏ_fd) + _dot(x̄, ẋ_fd), _dot(ȳ, ẏ_ad) + _dot(x̄, ẋ_ad))
+            (
+                _dot(ȳ_normdir, ẏ_fd) + _dot(x̄_normdir, ẋ_fd),
+                _dot(ȳ_normdir, ẏ_ad) + _dot(x̄_normdir, ẋ_ad),
+            )
         end
         display(vals)
     end
@@ -505,7 +581,16 @@ function test_frule_correctness(rng::AbstractRNG, x_ẋ...; frule, unsafe_pertur
 end
 
 # Assumes that the interface has been tested, and we can simply check for numerical issues.
-function test_rrule_correctness(rng::AbstractRNG, x_x̄...; rrule, unsafe_perturb::Bool)
+function test_rrule_correctness(
+    rng::AbstractRNG,
+    x_x̄...;
+    rrule,
+    unsafe_perturb::Bool,
+    output_tangent=nothing,
+    rtol=1e-3,
+    atol=1e-3,
+    max_fd_step::Union{Nothing,Real}=nothing,
+)
     @nospecialize rng x_x̄
 
     x_x̄ = map(_deepcopy, x_x̄) # defensive copy
@@ -518,14 +603,22 @@ function test_rrule_correctness(rng::AbstractRNG, x_x̄...; rrule, unsafe_pertur
     x_primal = _deepcopy(x)
     y_primal = x_primal[1](x_primal[2:end]...)
 
-    # Construct tangent to inputs, and normalise to be of unit length.
+    # Construct random tangent to inputs, and normalise to be of unit length.
     ẋ_unnormalised = map(_x -> randn_tangent(rng, _x), x)
-    nrm = sqrt(sum(x -> _dot(x, x), ẋ_unnormalised))
-    ẋ = map(_x -> _scale(1 / nrm, _x), ẋ_unnormalised)
+    ẋ = map(normalize_tangent, ẋ_unnormalised)
 
     # Use finite differences to estimate vjps. Compute the estimate at a range of different
     # step sizes. We'll just require that one of them ends up being close to what AD gives.
     ε_list = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
+    if max_fd_step !== nothing
+        ε_list = filter(≤(max_fd_step), ε_list)
+        length(ε_list) ≥ 2 || throw(
+            ArgumentError(
+                "max_fd_step=$max_fd_step leaves fewer than two FD steps; the fixed " *
+                "grid ends at 1e-7, so the smallest usable cap is 1e-6.",
+            ),
+        )
+    end
     fd_results = Vector{Any}(undef, length(ε_list))
     for (n, ε) in enumerate(ε_list)
         x′_l = _add_to_primal(x, _scale(ε, ẋ), unsafe_perturb)
@@ -560,7 +653,8 @@ function test_rrule_correctness(rng::AbstractRNG, x_x̄...; rrule, unsafe_pertur
     @test address_maps_are_consistent(inputs_address_map, outputs_address_map)
 
     # Run reverse-pass.
-    ȳ_delta = randn_tangent(rng, primal(y_ȳ_rule))
+    ȳ_delta =
+        isnothing(output_tangent) ? randn_tangent(rng, primal(y_ȳ_rule)) : output_tangent
     x̄_delta = map(Base.Fix1(randn_tangent, rng) ∘ primal, x_x̄_rule)
 
     ȳ_init = set_to_zero!!(zero_tangent(primal(y_ȳ_rule), tangent(y_ȳ_rule)))
@@ -582,8 +676,8 @@ function test_rrule_correctness(rng::AbstractRNG, x_x̄...; rrule, unsafe_pertur
         return isapprox(
             _dot(ȳ_delta, ẏ) + _dot(x̄_delta, ẋ_post),
             _dot(x̄, ẋ);
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=rtol,
+            atol=atol,
         )
     end
     if !any(isapprox_results)
@@ -603,6 +697,84 @@ _deepcopy(x) = deepcopy(x)
 _deepcopy(x::Module) = x
 
 rrule_output_type(::Type{Ty}) where {Ty} = Tuple{Mooncake.fcodual_type(Ty),Any}
+
+function test_frule_reuse(x_ẋ...; frule)
+    @nospecialize x_ẋ
+    x_ẋ_a = map(_deepcopy, x_ẋ)
+    x_ẋ_b = map(_deepcopy, x_ẋ)
+
+    # Snapshot every observable at the same point in each cycle. Without snapshots,
+    # an aliased mutable buffer would let call B overwrite call A's data; snapshotting
+    # only one side would compare different temporal points if a rule mutates inputs.
+    # Skip the deepcopy when tangent is NoTangent: such primals (e.g. Module-containing
+    # types like Core.TypeName) can't safely be deepcopied and can't be mutated either.
+    y_ẏ_a = frule(x_ẋ_a...)
+    y_primal_a = tangent(y_ẏ_a) isa NoTangent ? primal(y_ẏ_a) : _deepcopy(primal(y_ẏ_a))
+    ẏ_a = _deepcopy(tangent(y_ẏ_a))
+    ẋ_a = map(_deepcopy ∘ tangent, x_ẋ_a)
+
+    y_ẏ_b = frule(x_ẋ_b...)
+    y_primal_b = tangent(y_ẏ_b) isa NoTangent ? primal(y_ẏ_b) : _deepcopy(primal(y_ẏ_b))
+    ẏ_b = _deepcopy(tangent(y_ẏ_b))
+    ẋ_b = map(_deepcopy ∘ tangent, x_ẋ_b)
+
+    @test has_equal_data(y_primal_a, y_primal_b)
+    @test has_equal_data(ẏ_a, ẏ_b)
+    @test all(map(has_equal_data, ẋ_a, ẋ_b))
+end
+
+function test_rrule_reuse(rng::AbstractRNG, x_x̄...; rrule, output_tangent=nothing)
+    @nospecialize rng x_x̄
+    x = map(primal, x_x̄)
+    x̄_zero_a = map(zero_tangent, x)
+    x_x̄_a = map(
+        (x, x̄_f) -> fcodual_type(_typeof(x))(_deepcopy(x), x̄_f),
+        x,
+        map(Mooncake.fdata, x̄_zero_a),
+    )
+    x̄_zero_b = map(zero_tangent, x)
+    x_x̄_b = map(
+        (x, x̄_f) -> fcodual_type(_typeof(x))(_deepcopy(x), x̄_f),
+        x,
+        map(Mooncake.fdata, x̄_zero_b),
+    )
+
+    # Snapshot every observable at the same point in each cycle: post-forward for
+    # output primal/fdata, post-pullback for inputs and pullback returns. Without
+    # snapshots, aliased mutable buffers can alias-pass; snapshotting only one side
+    # would compare different temporal points since the pullback restores in-place
+    # mutations on the way back.
+    # Skip the deepcopy when tangent (fdata) is NoFData: such primals (e.g. Module-
+    # containing types like Core.TypeName) can't safely be deepcopied and the pullback
+    # has no fdata path through which it could mutate them.
+    y_ȳ_a, pb_a!! = rrule(x_x̄_a...)
+    y_primal_a = tangent(y_ȳ_a) isa NoFData ? primal(y_ȳ_a) : _deepcopy(primal(y_ȳ_a))
+    y_fdata_a = _deepcopy(tangent(y_ȳ_a))
+    ȳ_delta = if isnothing(output_tangent)
+        randn_tangent(rng, primal(y_ȳ_a))
+    else
+        output_tangent
+    end
+    ȳ_a = increment!!(
+        set_to_zero!!(zero_tangent(primal(y_ȳ_a), tangent(y_ȳ_a))), _deepcopy(ȳ_delta)
+    )
+    x̄_rvs_a = _deepcopy(pb_a!!(Mooncake.rdata(ȳ_a)))
+    x̄_fwds_a = map(_deepcopy ∘ Mooncake.fdata, x̄_zero_a)
+
+    y_ȳ_b, pb_b!! = rrule(x_x̄_b...)
+    y_primal_b = tangent(y_ȳ_b) isa NoFData ? primal(y_ȳ_b) : _deepcopy(primal(y_ȳ_b))
+    y_fdata_b = _deepcopy(tangent(y_ȳ_b))
+    ȳ_b = increment!!(
+        set_to_zero!!(zero_tangent(primal(y_ȳ_b), tangent(y_ȳ_b))), _deepcopy(ȳ_delta)
+    )
+    x̄_rvs_b = _deepcopy(pb_b!!(Mooncake.rdata(ȳ_b)))
+    x̄_fwds_b = map(_deepcopy ∘ Mooncake.fdata, x̄_zero_b)
+
+    @test has_equal_data(y_primal_a, y_primal_b)
+    @test has_equal_data(y_fdata_a, y_fdata_b)
+    @test has_equal_data(x̄_rvs_a, x̄_rvs_b)
+    @test all(map(has_equal_data, x̄_fwds_a, x̄_fwds_b))
+end
 
 function test_frule_interface(x_ẋ...; frule)
     @nospecialize x_ẋ
@@ -693,6 +865,11 @@ function test_rrule_interface(f_f̄, x_x̄...; rrule)
     @test Mooncake._verify_fdata_value(IdDict{Any,Nothing}(), y_ȳ.x, y_ȳ.dx) === nothing
 
     # Run the reverse-pass. Throw a meaningful exception if it doesn't run at all.
+    # The seed below is zero, and for an array-returning rule the whole cotangent is the
+    # rule's own freshly-zeroed fdata, so the pullback never sees a non-zero one. Writing
+    # zero outside a structured tangent (`UpperTriangular` and friends) is permitted, so
+    # this cannot catch a rule that fails to project its adjoint onto the tangent's
+    # structure. Only a correctness test can: it seeds a random cotangent instead.
     ȳ = Mooncake.rdata(zero_tangent(primal(y_ȳ), tangent(y_ȳ)))
     f̄_new, x̄_new... = try
         pb!!(ȳ)
@@ -740,6 +917,7 @@ function test_frule_performance(
             ),
         )
     end
+
     performance_checks_flag == :none && return nothing
 
     if performance_checks_flag in (:stability, :stability_and_allocs)
@@ -757,11 +935,23 @@ function test_frule_performance(
 
         # Test allocations in primal.
         f(x...)
-        @test (@allocations f(x...)) == 0
+        # On Julia 1.10 under `Pkg.test`, `--check-bounds=yes` can introduce small,
+        # configuration-dependent allocations even for primal calls that are otherwise
+        # zero-alloc in ordinary execution. Keep the zero-allocation assertion in the
+        # default/performance configuration, but skip it in that test-only mode.
+        if !(VERSION < v"1.11-" && Base.JLOptions().check_bounds == 1)
+            @test count_allocs(f, x...) == 0
+        end
 
         # Test allocations in forwards-mode.
-        __forwards(rule, f_ḟ, x_ẋ...)
-        @test (@allocations __forwards(rule, f_ḟ, x_ẋ...)) == 0
+        # On Julia 1.10, __call_rule uses Base.inferencebarrier to work around a codegen
+        # crash (julia#61368). This boxes isbits values (e.g. Dual{Float64}) at every
+        # nested rule callsite inside the compiled OC, producing non-zero alloc counts
+        # even for correct rules. Skip this check on Julia < 1.11.
+        @static if VERSION >= v"1.11-"
+            __forwards(rule, f_ḟ, x_ẋ...)
+            @test count_allocs(__forwards, rule, f_ḟ, x_ẋ...) == 0
+        end
     end
 end
 
@@ -800,14 +990,21 @@ function test_rrule_performance(
 
         # Test allocations in primal.
         f(x...)
-        @test (@allocations f(x...)) == 0
+        if !(VERSION < v"1.11-" && Base.JLOptions().check_bounds == 1)
+            @test count_allocs(f, x...) == 0
+        end
 
         # Test allocations in round-trip.
-        f_f̄_fwds = to_fwds(f_f̄)
-        x_x̄_fwds = map(to_fwds, x_x̄)
-        __forwards_and_backwards(rule, f_f̄_fwds, x_x̄_fwds...)
-        count_allocs(__forwards_and_backwards, rule, f_f̄_fwds, x_x̄_fwds...)
-        @test count_allocs(__forwards_and_backwards, rule, f_f̄_fwds, x_x̄_fwds...) == 0
+        # Skip on Julia < 1.11 for the same reason as the frule check above: the
+        # inferencebarrier workaround in __call_rule boxes isbits values at every
+        # nested rule callsite inside the compiled OC, producing spurious non-zero
+        # alloc counts on Julia 1.10.
+        @static if VERSION >= v"1.11-"
+            f_f̄_fwds = to_fwds(f_f̄)
+            x_x̄_fwds = map(to_fwds, x_x̄)
+            __forwards_and_backwards(rule, f_f̄_fwds, x_x̄_fwds...)
+            @test count_allocs(__forwards_and_backwards, rule, f_f̄_fwds, x_x̄_fwds...) == 0
+        end
     end
 end
 
@@ -824,6 +1021,12 @@ __get_primals(xs) = map(x -> x isa Union{Dual,CoDual} ? primal(x) : x, xs)
         debug_mode::Bool=false,
         unsafe_perturb::Bool=false,
         print_results=true,
+        output_tangent=nothing,
+        atol=1e-3,
+        rtol=1e-3,
+        frule=nothing,
+        rrule=nothing,
+        max_fd_step::Union{Nothing,Real}=nothing,
     )
 
 Run standardised tests on the `rule` for `x`.
@@ -850,11 +1053,11 @@ signature associated to `x` corresponds to a primitive, a hand-written rule will
     therefore, be generated for it automatically.
 - `is_primitive::Bool=true`: check whether the thing that you are testing has a hand-written
     `rrule!!`. This option is helpful if you are testing a new `rrule!!`, as it enables you
-    to verify that your method of `is_primitive` has returned the correct value, and that
-    you are actually testing a method of the `rrule!!` function -- a common mistake when
-    authoring a new `rrule!!` is to implement `is_primitive` incorrectly and to accidentally
-    wind up testing a rule which Mooncake has derived, as opposed to the one that you have
-    written. If you are testing something for which you have not
+    to verify that a method of `is_primitive` exists whose signature matches these
+    arguments, and that you are actually testing a method of the `rrule!!` function -- a
+    common mistake when authoring a new `rrule!!` is to implement `is_primitive` incorrectly
+    and to accidentally wind up testing a rule which Mooncake has derived, as opposed to the
+    one that you have written. If you are testing something for which you have not
     hand-written an `rrule!!`, or which you do not care whether it has a hand-written
     `rrule!!` or not, you should set it to `false`.
 - `perf_flag::Symbol=:none`: the value of this symbol determines what kind of performance
@@ -873,6 +1076,61 @@ signature associated to `x` corresponds to a primitive, a hand-written rule will
 - `unsafe_perturb::Bool=false`: value passed as the third argument to `_add_to_primal`.
     Should usually be left `false` -- consult the docstring for `_add_to_primal` for more
     info on when you might wish to set it to `true`.
+- `output_tangent=nothing`: final output tangent to initialize reverse mode with for testing
+    the correctness of reverse rules.
+- `atol=1e-3`: absolute tolerance for correctness check of the Fréchet derivatives.
+- `rtol=1e-3`: relative tolerance for correctness check of the Fréchet derivatives.
+- `frule=nothing`: if provided, use this callable as the forward rule instead of building one
+    from the interpreter. Useful for testing a hand-written `frule!!` directly.
+- `rrule=nothing`: if provided, use this callable as the reverse rule instead of building one
+    from the interpreter. Useful for testing a hand-written `rrule!!` directly.
+- `max_fd_step::Union{Nothing,Real}=nothing`: cap on finite-difference step sizes; only
+    `ε ≤ max_fd_step` are used. Each argument's tangent is unit-normalised independently,
+    so each argument is perturbed by at most `max_fd_step` in L2 norm. Set this for
+    domain-restricted functions (`log`, `sqrt`, `cholesky`) to keep perturbations inside
+    the domain. The FD grid ends at `1e-7`; the smallest usable cap is `1e-6`.
+
+# Limitations
+
+The rule's *value* is checked directly, against `f(x)` at `√eps` tolerance, along with
+argument equality, address-map consistency and — in reverse mode — restoration of the inputs
+by the pullback. The *derivative* is assessed against central finite differences, as one
+`isapprox` over `ȳ·ẏ + x̄·ẋ`. Note that `ẋ` is itself reconstructed by differencing, so that
+term's accuracy — not only the derivative's — decides the outcome. The comparison passes
+when *any* single `ε` on the grid agrees, which is what lets several things through:
+
+- derivative *precision* in a saturated regime. Where `f(x ± ε)` round to the same float for
+    every `ε`, the estimate is `0` whatever the rule returns, so a rule that has lost the
+    derivative entirely passes as readily as an exact one — with no tolerance slack
+    involved, since most of the grid agrees exactly.
+
+- arguments whose spacing is coarse against the step grid. What decides this is
+    `spacing(x)` versus `2ε`, not the element type: `Float16` is simply where ordinary
+    magnitudes reach it first. Once `spacing(x)` exceeds the largest step, `x ± ε` rounds
+    back to `x`, so the reconstruction of `ẋ` is exactly `0` for every step and the `x̄·ẋ`
+    term vanishes whatever the rule returns — from `Float16(64)`, whose spacing is `0.0625`,
+    and equally from `Float64` `1e15`, whose spacing is `0.125`. Below that boundary the
+    reconstruction degrades rather than vanishing: `Float16(2)` gives `0.977` then `1.465`
+    for the first two steps before collapsing to `0`.
+
+    Where the argument does move, the *output's* precision can still spoil the `ȳ·ẏ` term
+    independently. At `Float16(0)`, whose spacing is `6e-8`, `ẋ` reconstructs to within
+    0.02%, yet `exp` and a `sigmoid` differ from their true derivatives by 2.3% because the
+    output rounds to `Float16` — so a `Float16` case at zero fails on `ẏ`, not on `ẋ`.
+    Loosening `atol`/`rtol` is what makes that usable: the BFloat16 suite runs at
+    `0.2`/`0.4`. It does not help the vanishing case, where no tolerance below 1 suffices.
+
+- ties and kinks, where whether they agree depends on the case. A central difference returns
+    the mean of the one-sided directional derivatives. At a two-way tie that mean *is* the
+    symmetric split, so they agree exactly and such a case is testable. With three or more
+    tied members they part company, and at a kink they part company too when the rule takes
+    a one-sided value — `abs` at zero gives `0` against the rule's `1`. Where they differ
+    both are subgradients, so a disagreement is not evidence of a defect, and an agreement
+    is not evidence of correctness.
+
+Accepting a caller-supplied reference derivative would close the first two. Until then, a
+rule whose derivative depends on any of these needs pinning some other way — calling the
+rule and comparing a wider-precision or analytic reference is what the rules in `ext/` do.
 """
 function test_rule(
     rng::AbstractRNG,
@@ -884,6 +1142,12 @@ function test_rule(
     debug_mode::Bool=false,
     unsafe_perturb::Bool=false,
     print_results=true,
+    output_tangent=nothing,
+    atol=1e-3,
+    rtol=1e-3,
+    frule=nothing,
+    rrule=nothing,
+    max_fd_step::Union{Nothing,Real}=nothing,
 )
     # Take a copy of `x` to ensure that we do not mutate the original.
     x = deepcopy(x)
@@ -892,14 +1156,33 @@ function test_rule(
     sig = _typeof(__get_primals(x))
     test_fwd = mode in [nothing, ForwardMode]
     test_rvs = mode in [nothing, ReverseMode]
-    fwd_interp = test_fwd ? get_interpreter(ForwardMode) : missing
-    rvs_interp = test_rvs ? get_interpreter(ReverseMode) : missing
-    frule = test_fwd ? build_frule(fwd_interp, sig; debug_mode) : missing
-    rrule = test_rvs ? build_rrule(rvs_interp, sig; debug_mode) : missing
+    fwd_interp = (test_fwd && isnothing(frule)) ? get_interpreter(ForwardMode) : missing
+    rvs_interp = (test_rvs && isnothing(rrule)) ? get_interpreter(ReverseMode) : missing
+    frule = if !isnothing(frule)
+        frule
+    elseif test_fwd
+        build_frule(fwd_interp, sig; debug_mode)
+    else
+        missing
+    end
+    rrule = if !isnothing(rrule)
+        rrule
+    elseif test_rvs
+        build_rrule(rvs_interp, sig; debug_mode)
+    else
+        missing
+    end
 
-    # If something is primitive, then the rule should be `rrule!!`.
-    test_fwd && is_primitive && @test frule == frule!!
-    test_rvs && is_primitive && @test rrule == (debug_mode ? DebugRRule(rrule!!) : rrule!!)
+    # If something is primitive, then the rule should be `frule!!` or `rrule!!`.
+    # Skip when a pre-built rule was supplied — the caller owns it.
+    test_fwd &&
+        is_primitive &&
+        !ismissing(fwd_interp) &&
+        @test frule == (debug_mode ? DebugFRule(frule!!) : frule!!)
+    test_rvs &&
+        is_primitive &&
+        !ismissing(rvs_interp) &&
+        @test rrule == (debug_mode ? DebugRRule(rrule!!) : rrule!!)
 
     # Generate random tangents for anything that is not already a CoDual.
     x_ẋ = map(x -> x isa CoDual ? Dual(primal(x), tangent(x)) : randn_dual(rng, x), x)
@@ -915,6 +1198,18 @@ function test_rule(
     redirector = print_results ? ((f, x) -> f()) : redirect_stdout
     ts = redirector(devnull) do
         @testset "$(typeof(x))" begin
+            # Verify rules give identical results on a second call,
+            # i.e. the rule does not corrupt its internal state across calls.
+            @testset "Reuse" begin
+                if test_fwd && !interface_only
+                    test_frule_reuse(x_ẋ...; frule)
+                end
+                if test_rvs && !interface_only
+                    # Isolated rng so Reuse doesn't perturb Correctness's rng state.
+                    test_rrule_reuse(Xoshiro(123), x_x̄...; rrule, output_tangent)
+                end
+            end
+
             # Test that the interface is basically satisfied (checks types / memory addresses).
             @testset "Interface (1)" begin
                 test_fwd && test_frule_interface(x_ẋ...; frule)
@@ -924,10 +1219,21 @@ function test_rule(
             # Test that answers are numerically correct / consistent.
             @testset "Correctness" begin
                 if test_fwd && !interface_only
-                    test_frule_correctness(rng, x_ẋ...; frule, unsafe_perturb)
+                    test_frule_correctness(
+                        rng, x_ẋ...; frule, unsafe_perturb, atol, rtol, max_fd_step
+                    )
                 end
                 if test_rvs && !interface_only
-                    test_rrule_correctness(rng, x_x̄...; rrule, unsafe_perturb)
+                    test_rrule_correctness(
+                        rng,
+                        x_x̄...;
+                        rrule,
+                        unsafe_perturb,
+                        output_tangent,
+                        atol,
+                        rtol,
+                        max_fd_step,
+                    )
                 end
             end
 
@@ -939,18 +1245,18 @@ function test_rule(
 
             # Verify that rules have been cached.
             @testset "Caching" begin
-                if test_fwd
+                if test_fwd && !ismissing(fwd_interp)
                     C_fwd = Mooncake.context_type(fwd_interp)
-                    if !Mooncake.is_primitive(C_fwd, ForwardMode, sig)
-                        cache_key = (sig, false, :forward)
+                    if !Mooncake.is_primitive(C_fwd, ForwardMode, sig, fwd_interp.world)
+                        cache_key = (sig, debug_mode, :forward)
                         k = Mooncake.ClosureCacheKey(fwd_interp.world, cache_key)
                         @test haskey(fwd_interp.oc_cache, k)
                     end
                 end
-                if test_rvs
+                if test_rvs && !ismissing(rvs_interp)
                     C_rvs = Mooncake.context_type(rvs_interp)
-                    if !Mooncake.is_primitive(C_rvs, ReverseMode, sig)
-                        cache_key = (sig, false, :reverse)
+                    if !Mooncake.is_primitive(C_rvs, ReverseMode, sig, rvs_interp.world)
+                        cache_key = (sig, debug_mode, :reverse)
                         k = Mooncake.ClosureCacheKey(rvs_interp.world, cache_key)
                         @test haskey(rvs_interp.oc_cache, k)
                     end
@@ -962,25 +1268,100 @@ function test_rule(
     return ts
 end
 
-function run_hand_written_rule_test_cases(rng_ctor, v::Val, mode::Type{<:Mode})
-    test_cases, memory =
-        test_hook(Mooncake.generate_hand_written_rrule!!_test_cases, rng_ctor, v) do
-            Mooncake.generate_hand_written_rrule!!_test_cases(rng_ctor, v)
+"""
+    test_rule_throws(
+        rng::AbstractRNG, f, x...;
+        err::Union{Nothing,Type}=nothing,
+        msg::Union{Nothing,AbstractString,Regex}=nothing,
+        mode::Union{Nothing,Type{ForwardMode},Type{ReverseMode}}=nothing,
+        primal::Bool=false,
+    )
+
+Assert that differentiating `f(x...)` throws, in both modes unless `mode` names one. Use it
+for calls a rule deliberately refuses, in place of a `@test_throws` written out per mode.
+
+Give `err`, an exception type the thrown error must be an instance of, or `msg`, a string or
+regex that `showerror` output must contain, or both -- `@test_throws` accepts only one of the
+two, which is the gap this fills. A rule that re-raises inside a wrapper error matches `msg`
+while failing `err`, so pin the type only where the rule throws it directly.
+
+`primal=true` also requires `f(x...)` itself to throw, separating a call that is already
+invalid before AD sees it from one whose primal is fine and which only AD refuses.
+
+Forward-mode tangents come from `rng`, not from `zero_tangent`: a guard that fires only when
+an argument carries a derivative -- a keyword the rule treats as constant, say -- sees
+nothing to refuse in a zero seed and would let the case pass while asserting nothing.
+Reverse mode seeds its inputs itself and has no such tangent to offer, so name
+`mode=ForwardMode` for a guard only a nonzero tangent reaches.
+"""
+function test_rule_throws(
+    rng::AbstractRNG,
+    f,
+    x...;
+    err::Union{Nothing,Type}=nothing,
+    msg::Union{Nothing,AbstractString,Regex}=nothing,
+    mode::Union{Nothing,Type{ForwardMode},Type{ReverseMode}}=nothing,
+    primal::Bool=false,
+)
+    if isnothing(err) && isnothing(msg)
+        throw(
+            ArgumentError(
+                "test_rule_throws needs `err`, `msg`, or both: with neither it would only " *
+                "assert that something was thrown.",
+            ),
+        )
+    end
+    primal && _test_throws(err, msg) do
+        f(x...)
+    end
+    if mode in [nothing, ReverseMode]
+        _test_throws(err, msg) do
+            Mooncake.value_and_gradient!!(build_rrule(f, x...), f, x...)
         end
+    end
+    if mode in [nothing, ForwardMode]
+        duals = map(v -> randn_dual(rng, v), (f, x...))
+        _test_throws(err, msg) do
+            Mooncake.value_and_derivative!!(build_frule(f, x...), duals...)
+        end
+    end
+    return nothing
+end
+
+function _test_throws(thunk, err, msg)
+    caught = try
+        thunk()
+        nothing
+    catch e
+        e
+    end
+    @test caught !== nothing
+    isnothing(caught) && return nothing
+    isnothing(err) || @test caught isa err
+    isnothing(msg) || @test occursin(msg, sprint(showerror, caught))
+    return nothing
+end
+
+function run_hand_written_rule_test_cases(rng_ctor, v::Val, mode::Type{<:Mode})
+    test_cases, memory = test_hook(Mooncake.hand_written_rule_test_cases, rng_ctor, v) do
+        Mooncake.hand_written_rule_test_cases(rng_ctor, v)
+    end
+    # GC.@preserve keeps backing objects alive for tests involving pointer-backed
+    # types: without it, the GC may collect them mid-test.
     GC.@preserve memory @testset "$f, $(_typeof(x))" for (
         interface_only, perf_flag, _, f, x...
     ) in test_cases
 
         test_rule(rng_ctor(123), f, x...; interface_only, perf_flag, mode)
-        test_rule(rng_ctor(123), f, x...; interface_only, perf_flag, mode)
     end
 end
 
 function run_derived_rule_test_cases(rng_ctor, v::Val, mode::Type{<:Mode})
-    test_cases, memory =
-        test_hook(Mooncake.generate_derived_rrule!!_test_cases, rng_ctor, v, mode) do
-            Mooncake.generate_derived_rrule!!_test_cases(rng_ctor, v)
-        end
+    test_cases, memory = test_hook(Mooncake.derived_rule_test_cases, rng_ctor, v, mode) do
+        Mooncake.derived_rule_test_cases(rng_ctor, v)
+    end
+    # GC.@preserve keeps backing objects alive for tests involving pointer-backed
+    # types: without it, the GC may collect them mid-test.
     GC.@preserve memory @testset "$mode, $f, $(typeof(x))" for (
         interface_only, perf_flag, _, f, x...
     ) in test_cases
@@ -1076,10 +1457,11 @@ Verifies that the following functions are implemented correctly (as far as possi
 - [`Mooncake.increment_internal!!`](@ref)
 - [`Mooncake.set_to_zero_internal!!`](@ref)
 - [`Mooncake._add_to_primal_internal`](@ref)
-- [`Mooncake._diff_internal`](@ref)
 - [`Mooncake._dot_internal`](@ref)
 - [`Mooncake._scale_internal`](@ref)
 - [`Mooncake.TestUtils.populate_address_map_internal`](@ref)
+- [`Mooncake.tangent_to_primal_internal!!`](@ref)
+- [`Mooncake.primal_to_tangent_internal!!`](@ref)
 
 In conjunction with the functions tested by [`test_tangent_splitting`](@ref), these functions
 constitute a complete set of functions which must be applicable to `p` in order to ensure
@@ -1108,10 +1490,15 @@ function _test_tangent_interface(rng::AbstractRNG, p::P; interface_only=false) w
     function __add_to_primal(p, t, unsafe::Bool)
         return Mooncake._add_to_primal_internal(IdDict{Any,Any}(), p, t, unsafe)
     end
-    __diff(p, t) = Mooncake._diff_internal(IdDict{Any,Any}(), p, t)
     __dot(t, s) = Mooncake._dot_internal(IdDict{Any,Any}(), t, s)
     __scale(a::Float64, t) = Mooncake._scale_internal(IdDict{Any,Any}(), a, t)
     _populate_address_map(p, t) = populate_address_map_internal(AddressMap(), p, t)
+    _tangent_to_primal!!(p, t) = Mooncake.tangent_to_primal_internal!!(
+        p, t, IdDict{Any,Any}()
+    )
+    _primal_to_tangent!!(t, p) = Mooncake.primal_to_tangent_internal!!(
+        t, p, IdDict{Any,Any}()
+    )
 
     # Check that tangent_type returns a `Type`.
     T = tangent_type(P)
@@ -1190,7 +1577,6 @@ function _test_tangent_interface(rng::AbstractRNG, p::P; interface_only=false) w
     # Verify that operations required for finite difference testing to run, and produce the
     # correct output type.
     @test __add_to_primal(p, t, true) isa P
-    @test __diff(p, p) isa T
     @test __dot(t, t) isa Float64
     @test __scale(11.0, t) isa T
     @test _populate_address_map(p, t) isa AddressMap
@@ -1202,13 +1588,30 @@ function _test_tangent_interface(rng::AbstractRNG, p::P; interface_only=false) w
         if !has_equal_data(z, r)
             @test !has_equal_data(__add_to_primal(p, r, true), p)
         end
-        @test has_equal_data(__diff(p, p), _zero_tangent(p))
     end
     @test __dot(t, t) >= 0.0
     @test __dot(t, _zero_tangent(p)) == 0.0
     @test __dot(t, _increment!!(deepcopy(t), t)) ≈ 2 * __dot(t, t)
     @test has_equal_data(__scale(1.0, t), t)
     @test has_equal_data(__scale(2.0, t), _increment!!(deepcopy(t), t))
+
+    # Test for tangent_to_primal_internal!! / primal_to_tangent!!
+    p1 = deepcopy([p])[1]
+    t1 = _randn_tangent(rng, p1)
+    p1 = _tangent_to_primal!!(p1, t1)
+    @test p1 isa P
+    t2 = _zero_tangent(p1)
+    t2 = _primal_to_tangent!!(t2, p1)
+    @test t2 isa T
+    if !interface_only
+        @test has_equal_data(t1, t2)
+        # Test consistency with add_to_primal
+        t3 = _randn_tangent(rng, p1)
+        p2 = _add_to_primal(p1, t3, true)
+        t2 = _primal_to_tangent!!(t2, p2)
+        t3 = _increment!!(t3, t1)
+        @test has_equal_data(t2, t3)
+    end
 end
 
 # Helper used in `test_tangent_interface`.
@@ -1351,10 +1754,43 @@ function test_get_tangent_field_performance(t::Union{MutableTangent,Tangent})
     end
 end
 
-# Function barrier to ensure inference in value types.
-function count_allocs(f::F, x::Vararg{Any,N}) where {F,N}
-    test_hook(count_allocs, f, x...) do
-        @allocations f(x...)
+# Counts the number of GC allocations made by a function call.
+#
+# A plain Vararg method does not fully specialise on Type{T} arguments — they widen to
+# DataType — which causes spurious allocations to be reported. For example:
+#
+#   vararg(f::F, x::Vararg{Any,N}) where {F,N} = nothing
+#   vararg(rand, Xoshiro(1), Float64)
+#   Base.specializations(@which vararg(rand, Xoshiro(1), Float64))
+#   # => MethodInstance for vararg(::typeof(rand), ::Xoshiro, ::Type)
+#                                                               ^^^^^^ widened, abstract dispatch
+#
+#   explicit(f::F, x1::X1, x2::X2) where {F,X1,X2} = nothing
+#   explicit(rand, Xoshiro(1), Float64)
+#   Base.specializations(@which explicit(rand, Xoshiro(1), Float64))
+#   # => MethodInstance for explicit(::typeof(rand), ::Xoshiro, ::Type{Float64})
+#                                                                    ^^^^^^^^^^^ preserved
+#
+# @generated functions specialise fully on all argument types (including Type{T}), so
+# packing f and its arguments into one Vararg gives per-element-type specialisation
+# without explicit numbered overloads. @generated function bodies cannot contain closures,
+# so the measurement window (gc_num / gc_alloc_count) lives in __count_allocs (inlinable,
+# no barrier) and test_hook lives in the count_allocs wrapper so that external tools
+# (e.g. dispatch_doctor) can intercept and suppress the measurement where needed.
+@generated function __count_allocs(f_and_x::Vararg{Any,N}) where {N}
+    N >= 1 ||
+        return :(error("__count_allocs requires at least one argument (the function)"))
+    args = [:(f_and_x[$i]) for i in 2:N]
+    quote
+        stats = Base.gc_num()
+        f_and_x[1]($(args...))
+        Base.gc_alloc_count(Base.GC_Diff(Base.gc_num(), stats))
+    end
+end
+function count_allocs(f_and_x::Vararg{Any,N}; test_hook::Bool=true) where {N}
+    test_hook || return __count_allocs(f_and_x...)
+    return TestUtils.test_hook(count_allocs, f_and_x...) do
+        __count_allocs(f_and_x...)
     end
 end
 
@@ -1385,10 +1821,10 @@ function test_equality_comparison(x)
 
     # Check that the internal methods have been implemented.
     function _has_equal_data(x, y)
-        return has_equal_data_internal(x, y, true, Dict{Tuple{UInt,UInt},Bool}())
+        return has_equal_data_internal(x, y, true, IdDict{Any,Bool}())
     end
     function _has_equal_data_up_to_undefs(x, y)
-        return has_equal_data_internal(x, y, false, Dict{Tuple{UInt,UInt},Bool}())
+        return has_equal_data_internal(x, y, false, IdDict{Any,Bool}())
     end
 
     @test _has_equal_data(x, x) isa Bool

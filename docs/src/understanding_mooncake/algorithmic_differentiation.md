@@ -1,7 +1,7 @@
 # Algorithmic Differentiation
 
 This section introduces the mathematics behind AD.
-Even if you have worked with AD before, we recommend reading in order to acclimatise yourself to the perspective that Mooncake.jl takes on the subject.
+Even if you have worked with AD before, we recommend reading this to acclimatise yourself to the perspective that Mooncake.jl takes on the subject.
 
 # Derivatives
 
@@ -30,8 +30,8 @@ It is possible to stop here, as all the functions we shall need to consider can 
 However, to differentiate computer programmes, we must deal with complicated nested data structures, e.g. `struct`s inside `Tuple`s inside `Vector`s etc.
 While all of these data structures _can_ be mapped onto a flat vector in order to make sense of the Jacobian, this quickly becomes very inconvenient.
 To see the problem, consider the Julia function whose input is of type `Tuple{Tuple{Float64, Vector{Float64}}, Vector{Float64}, Float64}` and whose output is of type `Tuple{Vector{Float64}, Float64}`.
-What kind of object might be use to represent the derivative of a function mapping between these two spaces?
-We certainly _can_ treat these as structured "view" into a "flat" `Vector{Float64}`s, and then define a Jacobian, but actually _finding_ this mapping is a tedious exercise, even if it quite obviously exists.
+What kind of object might be used to represent the derivative of a function mapping between these two spaces?
+We certainly _can_ treat these as structured "views" into a "flat" `Vector{Float64}`, and then define a Jacobian, but actually _finding_ this mapping is a tedious exercise, even if it quite obviously exists.
 
 In fact, a more general formulation of the derivative is used all the time in the context of AD -- the matrix calculus discussed by [giles2008extended](@cite) and [minka2000old](@cite) (to name a couple) make use of a generalised form of the derivative in order to work with functions which map to and from matrices (albeit there are slight differences in naming conventions from text to text), without needing to "flatten" them into vectors in order to make sense of them.
 
@@ -56,10 +56,10 @@ Furthermore, the dot-notation (``\dot{x}``) does not have anything to do with ti
 So, instead of thinking of the derivative as a number or a matrix, we think about it as a _function_.
 We can express the previous notions of the derivative in this language.
 
-In the scalar case, rather than thinking of the derivative as _being_ ``\alpha``, we think of it is a the linear operator ``D f [x] (\dot{x}) := \alpha \dot{x}``.
-Put differently, rather than thinking of the derivative as the slope of the tangent to ``f`` at ``x``, think of it as the function decribing the tangent itself.
+In the scalar case, rather than thinking of the derivative as _being_ ``\alpha``, we think of it as the linear operator ``D f [x] (\dot{x}) := \alpha \dot{x}``.
+Put differently, rather than thinking of the derivative as the slope of the tangent to ``f`` at ``x``, think of it as the function describing the tangent itself.
 Observe that up until now we had only considered inputs to ``D f [x]`` which were small (``\text{d} x``) -- here we extend it to the entire space ``\mathcal{X}`` and denote inputs in this space ``\dot{x}``.
-Inputs ``\dot{x}`` should be thoughts of as "directions", in the directional derivative sense (why this is true will be discussed later).
+Inputs ``\dot{x}`` should be thought of as "directions", in the directional derivative sense (why this is true will be discussed later).
 
 Similarly, if ``\mathcal{X} = \RR^P`` and ``\mathcal{Y} = \RR^Q`` then this operator can be specified in terms of the Jacobian matrix: ``D f [x] (\dot{x}) := J[x] \dot{x}`` -- brackets are used to emphasise that ``D f [x]`` is a function, and is being applied to ``\dot{x}``.[^note_for_geometers]
 
@@ -77,19 +77,20 @@ By induction, this extends to a collection of ``N`` functions ``f_1, \dots, f_N`
 ```math
 f := f_N \circ \dots \circ f_1 \implies D f [x] = (D f_N [x_N]) \circ \dots \circ (D f_1 [x_1]),
 ```
-where ``x_{n+1} := f(x_n)``, and ``x_1 := x``.
+where ``x_{n+1} := f_n(x_n)``, and ``x_1 := x``.
 
 
-_**An aside: the definition of the Frechet Derivative**_
+_**An aside: the definition of the Fréchet Derivative**_
 
-This definition of the derivative has a name: the Frechet derivative.
-It is a generalisation of the Total Derivative.
-Formally, we say that a function ``f : \mathcal{X} \to \mathcal{Y}`` is differentiable at a point ``x \in \mathcal{X}`` if there exists a linear operator ``D f [x] : \mathcal{X} \to \mathcal{Y}`` (the derivative) satisfying
+The definition of the derivative we have been using is a generalisation of the Total Derivative.
+Formally, we say that a function ``f : \mathcal{X} \to \mathcal{Y}`` is differentiable at a point ``x \in \mathcal{X}`` if there exists a linear operator ``A : \mathcal{X} \to \mathcal{Y}`` satisfying
 ```math
-\lim_{\text{d} h \to 0} \frac{\| f(x + \text{d} h) - f(x) - D f [x] (\text{d} h)  \|_\mathcal{Y}}{\| \text{d}h \|_\mathcal{X}} = 0,
+\lim_{\text{d} h \to 0} \frac{\| f(x + \text{d} h) - f(x) - A (\text{d} h)  \|_\mathcal{Y}}{\| \text{d}h \|_\mathcal{X}} = 0,
 ```
 where ``\| \cdot \|_\mathcal{X}`` and ``\| \cdot \|_\mathcal{Y}`` are the norms associated to Hilbert spaces ``\mathcal{X}`` and ``\mathcal{Y}`` respectively.
-(The Frechet derivative does not depend on the choice of norms. All norms are _equivalent_ in finite dimensions, meaning they define the same topology and notion of convergence: if this equation is satisfied for one norm, it holds for all.)
+This linear operator ``A`` is known as the _Fréchet derivative_ of ``f`` at ``x``, denoted ``D f [x]``.
+Note that the Fréchet derivative is a _linear operator_, not a vector: when people casually refer to "the derivative" they often mean the gradient (a vector), but here we are working with the more general notion of a derivative as a linear map.
+(The Fréchet derivative does not depend on the choice of norms. All norms are _equivalent_ in finite dimensions, meaning they define the same topology and notion of convergence: if this equation is satisfied for one norm, it holds for all.)
 
 It is a good idea to consider what this looks like when ``\mathcal{X} = \mathcal{Y} = \RR`` and when ``\mathcal{X} = \mathcal{Y} = \RR^D``.
 It is sometimes helpful to refer to this definition to e.g. verify the correctness of the derivative of a function -- as with single-variable calculus, however, this is rare.
@@ -139,7 +140,7 @@ The goal of reverse-mode AD is as follows: given a differentiable function ``f :
 
 Notation: ``D f [x]^\ast`` denotes the single mathematical object which is the adjoint of ``D f [x]``.
 It is a linear function from ``\mathcal{Y}`` to ``\mathcal{X}``.
-We may occassionally write it as ``(D f [x])^\ast`` if there is some risk of confusion.
+We may occasionally write it as ``(D f [x])^\ast`` if there is some risk of confusion.
 
 We will explain _how_ reverse-mode AD goes about computing this after some worked examples.
 
@@ -162,7 +163,7 @@ We will put all of these problems in a single general framework later on.
 We have introduced some mathematical abstraction in order to simplify the calculations involved in AD.
 To this end, we consider differentiating ``f(X) := X^\top X``.
 Results for this and similar operations are given by [giles2008extended](@cite).
-A similar operation, but which maps from matrices to ``\RR`` is discussed in Lecture 4 part 2 of the MIT course mentioned previouly.
+A similar operation, but which maps from matrices to ``\RR`` is discussed in Lecture 4 part 2 of the MIT course mentioned previously.
 Both [giles2008extended](@cite) and [Lecture 4 part 2](https://ocw.mit.edu/courses/18-s096-matrix-calculus-for-machine-learning-and-beyond-january-iap-2023/resources/ocw_18s096_lecture04-part2_2023jan26_mp4/) provide approaches to obtaining the derivative of this function.
 
 Following either resource will yield the derivative:
@@ -170,7 +171,7 @@ Following either resource will yield the derivative:
 D f [X] (\dot{X}) = \dot{X}^\top X + X^\top \dot{X}
 ```
 Observe that this is indeed a linear operator (i.e. it is linear in its argument, ``\dot{X}``).
-(You can always plug it in to the definition of the Frechet derivative to confirm that it is indeed the derivative.)
+(You can always plug it in to the definition of the Fréchet derivative to confirm that it is indeed the derivative.)
 
 In order to perform reverse-mode AD, we need to find the adjoint operator.
 Using the usual definition of the inner product between matrices,
@@ -412,23 +413,23 @@ This "vector-Jacobian product" expression is commonly used to explain AD, and is
 
 Now we turn to using forwards- and reverse-mode AD to compute the gradient of a function.
 
-Recall that if ``D f[x] : \mathcal{X} \to \mathbb{R}`` is the Frechet derivative discussed here then ``D f[x](\dot{x})`` is the _directional derivative_ in the ``\dot{x}`` direction.
+Recall that if ``D f[x] : \mathcal{X} \to \mathbb{R}`` is the Fréchet derivative discussed here then ``D f[x](\dot{x})`` is the _directional derivative_ in the ``\dot{x}`` direction.
 
 The _gradient_ of ``f : \mathcal{X} \to \mathbb{R}`` at ``x`` is defined to be the vector ``\nabla f (x) \in \mathcal{X}`` such that
 ```math
 \langle \nabla f (x), \dot{x} \rangle = D f[x](\dot{x})
 ```
 for any direction ``\dot{x}``.
-In other words, the vector ``\nabla f`` encodes all the information about the directional derivatives of ``f``, and we use the inner product to retrieve that information.
+In other words, the vector ``\nabla f (x)`` encodes all the information about the directional derivatives of ``f`` at ``x``, and we use the inner product to retrieve that information.
 
 An alternative characterisation is that ``\nabla f(x)`` is the vector pointing in the direction of steepest ascent whose magnitude is given by the slope in that direction.
-In other words, if ``\hat{n} \coloneqq \argmax_{\|u\|=1} D f[x](u)`` is the unit vector in the direction of steepest ascent, then ``\nabla f = \|\nabla f\| \, \hat{n}`` and ``D f[x](\hat{n}) = \|\nabla f(x)\|``.
+In other words, if ``\hat{n} \coloneqq \argmax_{\|u\|=1} D f[x](u)`` is the unit vector in the direction of steepest ascent, then ``\nabla f (x) = \|\nabla f (x)\| \, \hat{n}`` and ``D f[x](\hat{n}) = \|\nabla f(x)\|``.
 (That this follows from the implicit definition above is a good exercise.)
 
 _**Aside: The choice of inner product**_
 
 Notice that the value of the gradient depends on how the inner product on ``\mathcal{X}`` is defined.
-Indeed, different choices of inner product result in different values of ``\nabla f``.
+Indeed, different choices of inner product result in different values of ``\nabla f (x)``.
 Adjoints such as ``D f[x]^*`` are also inner product dependent.
 However, the actual derivative ``D f[x]`` is of course invariant -- it does not depend on the inner product or norm.
 
@@ -450,7 +451,7 @@ Hence, the gradient is given by
 where the second equality follows from the gradient's definition.
 
 [^reciprocal_bases]:
-	For any basis ``\{\mathbf{e}_i\}`` there exists a reciprocal reciprocal basis ``\{\mathbf{e}^i\}`` such that ``\langle \mathbf{e}_i, \mathbf{e}^j \rangle = \delta_i^j``.
+	For any basis ``\{\mathbf{e}_i\}`` there exists a reciprocal basis ``\{\mathbf{e}^i\}`` such that ``\langle \mathbf{e}_i, \mathbf{e}^j \rangle = \delta_i^j``.
 	If the basis is orthonormal with respect to the inner product, then the original basis and its reciprocal are equal and ``\mathbf{e}_i = \mathbf{e}^i``.
 	We will always implicitly use orthonormal bases in Mooncake, so the position of indices can usually be ignored safely.
 
@@ -551,4 +552,4 @@ When each function ``f_n`` maps between Euclidean spaces, the applications of de
 ```@bibliography
 ```
 
-[^note_for_geometers]: in AD we only really need to discuss differentiatiable functions between vector spaces that are isomorphic to Euclidean space. Consequently, a variety of considerations which are usually required in differential geometry are not required here. Notably, the tangent space is assumed to be the same everywhere, and to be the same as the domain of the function. Avoiding these additional considerations helps keep the mathematics as simple as possible.
+[^note_for_geometers]: in AD we only really need to discuss differentiable functions between vector spaces that are isomorphic to Euclidean space. Consequently, a variety of considerations which are usually required in differential geometry are not required here. Notably, the tangent space is assumed to be the same everywhere, and to be the same as the domain of the function. Avoiding these additional considerations helps keep the mathematics as simple as possible.

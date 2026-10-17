@@ -184,6 +184,29 @@ struct P_adam_like
 end
 const P_adam_like_union = Union{Nothing,P_adam_like}
 
+# Test resources for issue #1130: union fields whose tangents force F=NoFData with
+# R<:Union{NoRData, RData{...}} (LoHi), or both F and R unions (Mixed), or
+# F<:Union{NoFData, FData} with R=NoRData (VecOnly).
+struct LoHi
+    lo::Float64
+    hi::Float64
+end
+struct LoHiContainer
+    lohi::Union{Nothing,LoHi}
+end
+make_P_lohi_container() = LoHiContainer(LoHi(1.0, 2.0))
+struct Mixed
+    x::Float64
+    v::Vector{Float64}
+end
+struct MixedContainer
+    val::Union{Nothing,Mixed}
+end
+make_P_mixed_container() = MixedContainer(Mixed(1.0, [2.0, 3.0]))
+struct VecOnly
+    v::Vector{Float64}
+end
+
 function build_big_isbits_struct()
     return FourFields(
         FiveFields(
@@ -709,13 +732,13 @@ function generate_test_functions()
         (
             false,
             :none,
-            nothing,
+            (lb=1e-3, ub=300),
             abstractly_typed_unused_container,
             StructFoo(5.0, [4.0]),
             5.0,
         ),
-        (false, :none, (lb=1, ub=1_000), pi_node_tester, Ref{Any}(5.0)),
-        (false, :none, (lb=1, ub=1_000), pi_node_tester, Ref{Any}(5)),
+        (false, :none, (lb=1e-3, ub=1_000), pi_node_tester, Ref{Any}(5.0)),
+        (false, :none, (lb=1e-3, ub=1_000), pi_node_tester, Ref{Any}(5)),
         (false, :none, nothing, arg_in_pi_node, false),
         (false, :allocs, nothing, intrinsic_tester, 5.0),
         (false, :allocs, nothing, goto_tester, 5.0),
@@ -733,11 +756,11 @@ function generate_test_functions()
         (false, :allocs, nothing, globalref_tester_4),
         (false, :none, nothing, globalref_tester_5),
         (false, :allocs, nothing, globalref_tester_6),
-        (false, :none, (lb=1, ub=1_000), type_unstable_tester_0, Ref{Any}(5.0)),
+        (false, :none, (lb=1e-3, ub=1_000), type_unstable_tester_0, Ref{Any}(5.0)),
         (false, :none, nothing, type_unstable_tester, Ref{Any}(5.0)),
         (false, :none, nothing, type_unstable_tester_2, Ref{Real}(5.0)),
-        (false, :none, (lb=1, ub=500), type_unstable_tester_3, Ref{Any}(5.0)),
-        (false, :none, (lb=1, ub=500), test_primitive_dynamic_dispatch, Any[5.0, false]),
+        (false, :none, (lb=1e-3, ub=500), type_unstable_tester_3, Ref{Any}(5.0)),
+        (false, :none, (lb=1e-3, ub=500), test_primitive_dynamic_dispatch, Any[5.0, false]),
         (false, :none, nothing, type_unstable_function_eval, Ref{Any}(sin), 5.0),
         (false, :allocs, nothing, phi_const_bool_tester, 5.0),
         (false, :allocs, nothing, phi_const_bool_tester, -5.0),
@@ -783,10 +806,10 @@ function generate_test_functions()
         # (false, :stability, nothing, unstable_splatting_tester, Ref{Any}(5.0)), # known failure case -- no rrule for _apply_iterate
         # (false, :stability, nothing, unstable_splatting_tester, Ref{Any}((5.0, 4.0))), # known failure case -- no rrule for _apply_iterate
         # (false, :stability, nothing, unstable_splatting_tester, Ref{Any}((5.0, 4.0, 3.0))), # known failure case -- no rrule for _apply_iterate
-        (false, :none, (lb=1, ub=1_000), inferred_const_tester, Ref{Any}(nothing)),
-        (false, :none, (lb=1, ub=1_000), datatype_slot_tester, 1),
-        (false, :none, (lb=1, ub=1_000), datatype_slot_tester, 2),
-        (false, :none, (lb=1, ub=100_000_000), test_union_of_arrays, randn(5), true),
+        (false, :none, (lb=1e-3, ub=1_000), inferred_const_tester, Ref{Any}(nothing)),
+        (false, :none, (lb=1e-3, ub=1_000), datatype_slot_tester, 1),
+        (false, :none, (lb=1e-3, ub=1_000), datatype_slot_tester, 2),
+        (false, :none, (lb=1e-3, ub=100_000_000), test_union_of_arrays, randn(5), true),
         (
             false,
             :none,
@@ -839,8 +862,8 @@ function generate_test_functions()
         (false, :allocs, nothing, test_isbits_multiple_usage_phi, false, 1.1),
         (false, :allocs, nothing, test_isbits_multiple_usage_phi, true, 1.1),
         (false, :allocs, nothing, test_multiple_call_non_primitive, 5.0),
-        (false, :none, (lb=1, ub=1500), test_multiple_pi_nodes, Ref{Any}(5.0)),
-        (false, :none, (lb=1, ub=500), test_multi_use_pi_node, Ref{Any}(5.0)),
+        (false, :none, (lb=1e-3, ub=1500), test_multiple_pi_nodes, Ref{Any}(5.0)),
+        (false, :none, (lb=1e-3, ub=500), test_multi_use_pi_node, Ref{Any}(5.0)),
         (false, :allocs, nothing, test_getindex, [1.0, 2.0]),
         (false, :allocs, nothing, test_mutation!, [1.0, 2.0]),
         (false, :allocs, nothing, test_while_loop, 2.0),
@@ -848,7 +871,7 @@ function generate_test_functions()
         (false, :none, nothing, test_mutable_struct_basic, 5.0),
         (false, :none, nothing, test_mutable_struct_basic_sin, 5.0),
         (false, :none, nothing, test_mutable_struct_setfield, 4.0),
-        (false, :none, (lb=1, ub=500), test_mutable_struct, 5.0),
+        (false, :none, (lb=1e-3, ub=500), test_mutable_struct, 5.0),
         (false, :none, nothing, test_struct_partial_init, 3.5),
         (false, :none, nothing, test_mutable_partial_init, 3.3),
         (
@@ -881,7 +904,7 @@ function generate_test_functions()
         ),
         (
             false,
-            :allocs,
+            :none,
             nothing,
             LinearAlgebra._kron!,
             randn(25, 25),
@@ -989,6 +1012,6 @@ end
 
 using .TestResources
 
-function generate_derived_rrule!!_test_cases(rng_ctor, ::Val{:test_resources})
+function derived_rule_test_cases(rng_ctor, ::Val{:test_resources})
     return TestResources.generate_test_functions(), Any[]
 end

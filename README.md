@@ -13,29 +13,67 @@
 
 </div>
 
-The goal of the `Mooncake.jl` project is to produce an AD package which is written entirely in Julia, which improves over `ForwardDiff.jl`, `ReverseDiff.jl` and `Zygote.jl` in several ways, and is competitive with `Enzyme.jl`.
-Please refer to [the docs](https://chalk-lab.github.io/Mooncake.jl/dev) for more info.
+The goal of the `Mooncake.jl` project is to produce an automatic differentiation (AD)
+package written entirely in Julia that improves on `ForwardDiff.jl`, `ReverseDiff.jl`,
+and `Zygote.jl` in several ways.
+Applying AD to Julia's type-inferred, optimised intermediate representation helps
+produce efficient derivative code.
+Support for mutation allows Mooncake to differentiate a wide range of numerical Julia code
+without hand-written rules.
+See the [documentation](https://chalk-lab.github.io/Mooncake.jl/stable) for details.
 
-## Getting Started
+## Performance
 
-Check that you're running a version of Julia that Mooncake.jl supports.
-See the `SUPPORT_POLICY.md` file for more info.
+On one system, [Flux benchmarks](test/integration_testing/flux/README.md) found Mooncake gradient evaluations after warm-up were 2.03 times as fast as Zygote on CPU across 19 models, with comparable GPU performance. First evaluations were substantially slower. See also the [DynamicPPL benchmarks](https://github.com/TuringLang/DynamicPPL.jl/blob/ca32f3a05f8f866f51ee35dd1bc81ecd75876033/benchmarks/posteriordb.md). **Performance varies by workload.** 
 
-There are several ways to interact with `Mooncake.jl`.
-We recommend that people interact with `Mooncake.jl` via  [`DifferentiationInterface.jl`](https://github.com/gdalle/DifferentiationInterface.jl/).
-For example, use it as follows to compute the gradient of a function mapping a `Vector{Float64}` to `Float64`.
+## Getting started
+
+Check whether Mooncake's [support policy](SUPPORT_POLICY.md) covers your Julia version.
+
+Mooncake uses reusable caches for repeated gradient and Hessian evaluations:
+
 ```julia
-using DifferentiationInterface
-import Mooncake
+import Mooncake as MC
 
-f(x) = sum(cos, x)
-backend = AutoMooncake() # Reverse-mode AD. For forward-mode AD, use `AutoMooncakeForward()`. 
-x = ones(1_000)
-prep = prepare_gradient(f, backend, x)
-gradient(f, prep, backend, x)
+f(x) = (1 - x[1])^2 + 100 * (x[2] - x[1]^2)^2  # Rosenbrock
+x = [1.2, 1.2]
+
+# Reverse mode
+grad_cache = MC.prepare_gradient_cache(f, x);
+value, (_, gradient) = MC.value_and_gradient!!(grad_cache, f, x)
+
+# Forward mode
+fwd_cache = MC.prepare_derivative_cache(f, x);
+value_fwd, (_, gradient_fwd) = MC.value_and_gradient!!(fwd_cache, f, x)
+
+# Hessian
+hess_cache = MC.prepare_hessian_cache(f, x);
+value, gradient, hessian = MC.value_gradient_and_hessian!!(hess_cache, f, x)
 ```
-You should expect that `prepare_gradient` takes a little bit of time to run, but that `gradient` is fast.
 
-We are committed to ensuring support for DifferentiationInterface, which is why we recommend using that.
-If you are interested in interacting more directly with `Mooncake.jl`, you should consider `Mooncake.value_and_gradient!!`.
-See its docstring for more info.
+Cache preparation takes some time, but calls that reuse the cache are fast. Each cache
+is tied to its inputs' types and sizes; passing a differently sized input raises an
+error. See the
+[tutorial](https://chalk-lab.github.io/Mooncake.jl/stable/tutorial/#Computing-gradients)
+for a walkthrough and the
+[interface](https://chalk-lab.github.io/Mooncake.jl/stable/interface/) for details.
+
+## Contributing
+
+In the spirit of long-lived projects such as R and TeX, we take a conservative
+approach to development: correctness, stability, and tightly scoped fixes take
+precedence over expanding the package's scope.
+
+Contributions are most welcome when they address reproducible defects, such as
+incorrect results, unexpected failures, or behaviour inconsistent with the
+documented scope.
+
+If you wish to extend Mooncake's coverage, we encourage you to organise
+independently. See the [support policy](SUPPORT_POLICY.md#scope-of-differentiation-rules)
+for guidance and examples.
+
+## Licensing
+
+Mooncake is licensed under the [MIT License](LICENSE). Its required and optional
+dependencies are licensed separately and may impose additional terms on redistributed
+applications or binaries. See [`Project.toml`](Project.toml) for the dependency list.

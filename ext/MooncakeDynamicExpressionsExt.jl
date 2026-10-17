@@ -84,7 +84,9 @@ function set_children!(t::TangentNode{Tv,D}, fdata::Tuple{Vararg{Any,deg}}) wher
 end
 
 function DE.extract_gradient(
-    gradient::Mooncake.Tangent{@NamedTuple{tree::TN,metadata::Mooncake.NoTangent}},
+    gradient::Mooncake.PossiblyMutableTangent{
+        @NamedTuple{tree::TN,metadata::Mooncake.NoTangent}
+    },
     tree::Expression{T},
 ) where {Tv,TN<:TangentNode{Tv},T}
     return DE.extract_gradient(gradient.fields.tree, DE.get_tree(tree))
@@ -235,7 +237,7 @@ function Mooncake.set_to_zero_internal!!(c::Mooncake.SetToZeroCache, t::TangentN
 end
 
 ################################################################################
-# Algebraic helpers (_dot / _scale / _add_to_primal / _diff)
+# Algebraic helpers (_dot / _scale / _add_to_primal / primal <-> tangent)
 ################################################################################
 
 Mooncake._dot_internal(c::Mooncake.MaybeCache, t::NoTangent, s::TangentNode) = 0.0
@@ -337,24 +339,50 @@ end
     end
 end
 
-function Mooncake._diff_internal(
-    c::Mooncake.MaybeCache, p::N, q::N
-) where {T,D,N<:AbstractExpressionNode{T,D}}
-    Tv = Mooncake.tangent_type(T)
-    Tv === NoTangent && return NoTangent()
-    key = (p, q)
-    return get!(() -> _diff_internal_helper(c, p, q), c, key)::TangentNode{Tv,D}
-end
-
-@generated function _diff_internal_helper(
-    c::Mooncake.MaybeCache, p::N, q::N
+@generated function Mooncake.tangent_to_primal_internal!!(
+    p::N, t, c::Mooncake.MaybeCache
 ) where {T,D,N<:AbstractExpressionNode{T,D}}
     quote
+        t isa NoTangent && return p
+        # Not using the cache since it's not clear to me
+        # which expressions are mutable and which are not
+        deg = p.degree
+        if deg == 0
+            if p.constant
+                new_leaf = leaf_copy(p)
+                new_leaf.val = Mooncake.tangent_to_primal_internal!!(p.val, t.val, c)
+                new_leaf
+            else
+                p
+            end
+        else
+            Base.Cartesian.@nif(
+                $D,
+                i -> i == deg,
+                i -> Base.Cartesian.@ncall(
+                    i,
+                    branch_copy,
+                    p,
+                    j -> Mooncake.tangent_to_primal_internal!!(
+                        DE.get_child(p, j), get_child(t, j), c
+                    )
+                )
+            )
+        end
+    end
+end
+@generated function Mooncake.primal_to_tangent_internal!!(
+    t, p::N, c::Mooncake.MaybeCache
+) where {T,D,N<:AbstractExpressionNode{T,D}}
+    quote
+        t isa NoTangent && return NoTangent()
+        # Not using the cache since it's not clear to me
+        # which expressions are mutable and which are not
         Tv = Mooncake.tangent_type(T)
         deg = p.degree
-        if p.degree == 0
+        if deg == 0
             if p.constant
-                TangentNode{Tv,D}(Mooncake._diff_internal(c, p.val, q.val))
+                TangentNode{Tv,D}(Mooncake.primal_to_tangent_internal!!(t.val, p.val, c))
             else
                 TangentNode{Tv,D}(nothing)
             end
@@ -366,7 +394,9 @@ end
                     i,
                     TangentNode{Tv,D},
                     nothing,
-                    j -> Mooncake._diff_internal(c, DE.get_child(p, j), DE.get_child(q, j))
+                    j -> Mooncake.primal_to_tangent_internal!!(
+                        get_child(t, j), DE.get_child(p, j), c
+                    )
                 )
             )
         end
@@ -776,27 +806,21 @@ function Mooncake.TestUtils.populate_address_map_internal(
 end
 
 function Mooncake.TestUtils.has_equal_data_internal(
-    x::N, y::N, equndef::Bool, d::Dict{Tuple{UInt,UInt},Bool}
+    x::N, y::N, equndef::Bool, d::IdDict{Any,Bool}
 ) where {T,N<:AbstractExpressionNode{T}}
-    idp = (objectid(x), objectid(y))
+    idp = (x, y)
     # Just use regular `AbstractExpressionNode` Base.:(==)
     return get!(() -> x == y, d, idp)
 end
 
 function Mooncake.TestUtils.has_equal_data_internal(
-    t::TangentNode{Tv,D},
-    s::TangentNode{Tv,D},
-    equndef::Bool,
-    d::Dict{Tuple{UInt,UInt},Bool},
+    t::TangentNode{Tv,D}, s::TangentNode{Tv,D}, equndef::Bool, d::IdDict{Any,Bool}
 ) where {Tv,D}
-    idp = (objectid(t), objectid(s))
+    idp = (t, s)
     return get!(() -> _has_equal_data_internal_helper(t, s, equndef, d), d, idp)
 end
 function _has_equal_data_internal_helper(
-    t::TangentNode{Tv,D},
-    s::TangentNode{Tv,D},
-    equndef::Bool,
-    d::Dict{Tuple{UInt,UInt},Bool},
+    t::TangentNode{Tv,D}, s::TangentNode{Tv,D}, equndef::Bool, d::IdDict{Any,Bool}
 ) where {Tv,D}
     deg = t.degree
     return deg == s.degree && if t.degree == 0

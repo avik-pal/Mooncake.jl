@@ -5,6 +5,12 @@ non_const_global = 5.0
 const const_float = 5.0
 const const_int = 5
 const const_bool = true
+const const_vector = [1.0, 2.0]
+
+function const_vector_phi(p, flag)
+    A = LowerTriangular([p[1] 0.0; p[2] p[1]] + I)
+    return sum(abs2, A \ (flag ? p : const_vector))
+end
 
 # used for regression test for issue 184
 struct A
@@ -19,7 +25,37 @@ struct MakeAUnionAll{T} end
 
 end
 
+# Regression for non-returning primals: `rule_type` must predict `Tuple{}` pullback args
+# to match `build_rrule`, otherwise lazy derived-rule materialization hits a type mismatch
+# (PR #1099).
+rule_type_nonreturning(e::Exception) = throw(e)
+
+# Helpers for the world-advance staleness test below (scope note in the forward-mode
+# analogue). `stale_rvs_lazy` uses LazyDerivedRule, `stale_rvs_dyn` DynamicDerivedRule.
+stale_rvs_inner(x) = Float32(x) * 2.0f0
+@noinline stale_rvs_callee(x) = stale_rvs_inner(x)
+# Two `:invoke` levels; see the forward-mode analogue for why one is not enough.
+@noinline stale_rvs_mid(x) = stale_rvs_callee(x)
+stale_rvs_lazy(x) = stale_rvs_mid(x)
+const STALE_RVS_FNS = Function[stale_rvs_mid]
+stale_rvs_dyn(x) = (STALE_RVS_FNS[1])(x)
+
 @testset "s2s_reverse_mode_ad" begin
+    @testset "const global fdata is reset between rule calls (#1282)" begin
+        f = S2SGlobals.const_vector_phi
+        rule = build_rrule(f, [0.3, 0.5], false)
+
+        function gradient(p)
+            dp = zeros(length(p))
+            y, pb = rule(zero_fcodual(f), CoDual(p, dp), zero_fcodual(false))
+            pb(one(primal(y)))
+            return dp
+        end
+
+        gradient([0.3, 0.5])
+        @test gradient([1.5, 2.0]) ≈ [-0.18944, -0.1536]
+    end
+
     @testset "SharedDataPairs" begin
         m = SharedDataPairs()
         id = Mooncake.add_data!(m, 5.0)
@@ -28,6 +64,16 @@ end
         @test m.pairs[1][2] == 5.0
     end
     @testset "ADInfo" begin
+        GlobalsTest = Module(:GlobalsTest, true)
+        Core.eval(GlobalsTest, quote
+            ___x = 5.0
+            ___y::Float64 = 5.0
+            @static if VERSION > v"1.12-"
+                const ___constx = 5.0
+                const ___consty::Float64 = 5.0
+            end
+        end)
+
         arg_types = Dict{Argument,Any}(Argument(1) => Float64, Argument(2) => Int)
         id_ssa_1 = ID()
         id_ssa_2 = ID()
@@ -52,14 +98,66 @@ end
         @test info.interp isa Mooncake.MooncakeInterpreter
 
         # Verify that we can get the type associated to Arguments, IDs, and others.
-        global ___x = 5.0
-        global ___y::Float64 = 5.0
         @test Mooncake.get_primal_type(info, Argument(1)) == Float64
         @test Mooncake.get_primal_type(info, Argument(2)) == Int
         @test Mooncake.get_primal_type(info, id_ssa_1) == Float64
         @test Mooncake.get_primal_type(info, GlobalRef(Base, :sin)) == typeof(sin)
-        @test Mooncake.get_primal_type(info, GlobalRef(Main, :___x)) == Any
-        @test Mooncake.get_primal_type(info, GlobalRef(Main, :___y)) == Float64
+        @test Mooncake.get_primal_type(info, GlobalRef(GlobalsTest, :___x)) == Any
+        @test Mooncake.get_primal_type(info, GlobalRef(GlobalsTest, :___y)) == Float64
+        @test Mooncake.get_primal_type(info, GlobalRef(Base, :Float64)) == Type{Float64}
+        # PARTITION_KIND_IMPLICIT_CONST
+        @test Mooncake.get_primal_type(info, GlobalRef(Main, :Float64)) == Type{Float64}
+        @test Mooncake.get_primal_type(info, GlobalRef(Base, :stdin)) == IO
+        # PARTITION_KIND_IMPLICIT_GLOBAL
+        @test Mooncake.get_primal_type(info, GlobalRef(Main, :stdin)) == IO
+        @static if VERSION > v"1.12-"
+            @test Mooncake.get_primal_type(info, GlobalRef(GlobalsTest, :___constx)) ==
+                Float64
+            @test Mooncake.get_primal_type(info, GlobalRef(GlobalsTest, :___consty)) ==
+                Float64
+
+            # Rebind globals using different types, this will increase the world age
+            Core.eval(GlobalsTest, quote
+                ___x = 5.0f0
+                # Note that we cannot change the type of ___y nor make it constant
+                const ___constx = 5.0f0
+                const ___consty::Float32 = 5.0f0
+            end)
+
+            # In the info's world age, this should not affect the types
+            # We have to use invokelatest otherwise the call to get_primal_type will run in the old world age
+            @test invokelatest(
+                Mooncake.get_primal_type, info, GlobalRef(GlobalsTest, :___x)
+            ) == Any
+            @test invokelatest(
+                Mooncake.get_primal_type, info, GlobalRef(GlobalsTest, :___constx)
+            ) == Float64
+            @test invokelatest(
+                Mooncake.get_primal_type, info, GlobalRef(GlobalsTest, :___consty)
+            ) == Float64
+
+            # But now we can create a new info in the new world age,
+            # where these updated bindings should be visible
+            info2 = ADInfo(
+                get_interpreter(ReverseMode),
+                arg_types,
+                ssa_insts,
+                is_used_dict,
+                false,
+                rdata_ref,
+                Any,
+                Any,
+            )
+            @test invokelatest(
+                Mooncake.get_primal_type, info2, GlobalRef(GlobalsTest, :___x)
+            ) == Any
+            @test invokelatest(
+                Mooncake.get_primal_type, info2, GlobalRef(GlobalsTest, :___constx)
+            ) == Float32
+            @test invokelatest(
+                Mooncake.get_primal_type, info2, GlobalRef(GlobalsTest, :___consty)
+            ) == Float32
+        end
         @test Mooncake.get_primal_type(info, 5) == Int
         @test Mooncake.get_primal_type(info, QuoteNode(:hello)) == Symbol
         @test Mooncake.get_primal_type(info, Expr(:boundscheck)) == Bool
@@ -277,6 +375,7 @@ end
             Tuple{typeof(TestResources.tuple_with_union),Bool},
             Tuple{typeof(TestResources.tuple_with_union_2),Bool},
             Tuple{typeof(TestResources.tuple_with_union_3),Bool,Bool},
+            Tuple{typeof(rule_type_nonreturning),ArgumentError},
         ],
         debug_mode in [true, false]
 
@@ -286,6 +385,43 @@ end
     end
     @testset "MooncakeRuleCompilationError" begin
         @test_throws(Mooncake.MooncakeRuleCompilationError, Mooncake.build_rrule(sin))
+        _trycatch_fn(x::Float64) =
+            try
+                ;
+                return log(x);
+            catch
+                ;
+                return 0.0;
+            end
+        @test_throws(
+            Mooncake.MooncakeRuleCompilationError, Mooncake.build_rrule(_trycatch_fn, 1.0)
+        )
+        # showerror should include the originating method's source location (issue #649)
+        function _rrule_error_test_llvmcall(x::Int64)
+            Base.llvmcall(
+                (
+                    """
+                declare i64 @llvm.abs.i64(i64, i1)
+                define i64 @entry(i64) {
+                %x = call i64 @llvm.abs.i64(i64 %0, i1 0)
+                ret i64 %x
+                }
+                    """,
+                    "entry",
+                ), Int64, Tuple{Int64}, x
+            )
+        end
+        err = try
+            Mooncake.build_rrule(Tuple{typeof(_rrule_error_test_llvmcall),Int64})
+            nothing
+        catch e
+            e
+        end
+        @test err isa Mooncake.MooncakeRuleCompilationError
+        msg = sprint(showerror, err; context=:displaysize => (24, 120))
+        @test startswith(msg, "Mooncake failed to differentiate the following method:")
+        @test contains(msg, "_rrule_error_test_llvmcall")
+        @test contains(msg, "Caused by:")
     end
     @testset "$(_typeof((f, x...)))" for (n, (interface_only, perf_flag, bnds, f, x...)) in
                                          collect(
@@ -329,12 +465,14 @@ end
     end
 
     @testset "integration testing for invalid global ref errors" begin
-        @test_throws(
-            Mooncake.Mooncake.MooncakeRuleCompilationError,
-            Mooncake.build_rrule(
-                Tuple{typeof(Mooncake.TestResources.non_const_global_ref),Float64}
+        @static if VERSION > v"1.12-"
+            @test_throws(
+                Mooncake.MooncakeRuleCompilationError,
+                Mooncake.build_rrule(
+                    Tuple{typeof(Mooncake.TestResources.non_const_global_ref),Float64}
+                )
             )
-        )
+        end
     end
 
     # Tests designed to prevent accidentally re-introducing issues which we have fixed.
@@ -358,9 +496,23 @@ end
         @benchmark Mooncake.value_and_gradient!!($rule, $f, $(Ref(0.0))[])
 
         # 660 -- ensure that the correct signature is used to construct DynamicDerivedRules
-        rule = Mooncake.DynamicDerivedRule(false)
+        rule = Mooncake.DynamicDerivedRule(false, Base.get_world_counter())
         args = (zero_fcodual(identity), zero_fcodual((v=S2SGlobals.MakeAUnionAll,)))
         @test rule(args...) isa Tuple{CoDual,Any}
+    end
+    @testset "_pullback_type" begin
+        # On Julia 1.10, keyword functions are lowered to old-style `##foo#N` wrappers
+        # rather than `Core.kwcall`. When Mooncake compiles a derived rrule for such a
+        # wrapper, `pullback_type` calls `Core.Compiler.return_type` on the inner `rrule!!`
+        # call. If inference gives up — e.g. because the `@from_rrule` wrapper calls
+        # `ChainRulesCore.rrule` and the pullback closure type cannot be resolved — it
+        # returns bare `Tuple`, whose `parameters` field is `svec(Vararg{Any})` (length 1).
+        # `_pullback_type` must not index past the end of that vector.
+        @test Mooncake._pullback_type(Tuple) === Any        # svec(Vararg{Any}), length 1
+        @test Mooncake._pullback_type(Tuple{}) === Any      # svec(), length 0
+        @test Mooncake._pullback_type(Tuple{Int}) === Any   # svec(Int), length 1
+        # Sanity-check: well-formed 2-element tuple still extracts the second parameter.
+        @test Mooncake._pullback_type(Tuple{Int,Float64}) === Float64
     end
     @testset "literal Strings do not appear in shared data" begin
         f() = "hello"
@@ -386,5 +538,487 @@ end
         @test rule_debug_sig isa Mooncake.DebugRRule
         rule_debug_args = build_rrule(args...; debug_mode=true, silence_debug_messages=true)
         @test rule_debug_args == rule_debug_sig
+    end
+
+    # Without the fix the lazy path throws a `convert` MethodError in _build_rule!; both
+    # paths must return the build-world result (Float32), not the post-advance (Float64).
+    @testset "stale rule build-world after world advance (issue #1218)" begin
+        lazy = Mooncake.build_rrule(stale_rvs_lazy, 1.5)
+        dyn = Mooncake.build_rrule(stale_rvs_dyn, 1.5)
+        @eval stale_rvs_inner(x::Float64) = x * 2.0  # advance world; tightens callee's type
+        lazy_y, _ = Base.invokelatest(
+            lazy, Mooncake.zero_fcodual(stale_rvs_lazy), Mooncake.zero_fcodual(1.5)
+        )
+        dyn_y, _ = Base.invokelatest(
+            dyn, Mooncake.zero_fcodual(stale_rvs_dyn), Mooncake.zero_fcodual(1.5)
+        )
+        @test Mooncake.primal(lazy_y) === 3.0f0
+        @test Mooncake.primal(dyn_y) === 3.0f0
+    end
+end
+
+# --- Working-IR layer (CFGBlock etc.) ---
+# Working IR lives in src/interpreter/reverse_mode.jl; shared primitives in ir_utils.jl.
+module CFGBlocksTestCases
+test_phi_node(x::Ref{Union{Float32,Float64}}) = sin(x[])
+end
+
+@testset "cfg_blocks" begin
+    @testset "ID" begin
+        id1 = ID()
+        id2 = ID()
+        @test id1 == id1
+        @test id1 != id2
+    end
+    @testset "CFGBlock" begin
+        bb = CFGBlock(
+            ID(),
+            ID[ID(), ID()],
+            CC.NewInstruction[
+                CC.NewInstruction(IDPhiNode([ID(), ID()], Any[true, false]), Any),
+                CC.NewInstruction(:(println("hello")), Any),
+            ],
+        )
+        @test bb isa CFGBlock
+        @test length(bb) == 2
+
+        ids, phi_nodes = Mooncake.phi_nodes(bb)
+        @test only(ids) == bb.inst_ids[1]
+        @test only(phi_nodes) == bb.insts[1]
+
+        bb_copy = copy(bb)
+        @test bb_copy.inst_ids !== bb.inst_ids
+
+        @test Mooncake.terminator(bb) === nothing
+
+        @test_throws ErrorException (bb.id = ID())
+
+        # The constructor enforces inst_ids and insts having equal length.
+        @test_throws AssertionError CFGBlock(ID(), ID[ID()], CC.NewInstruction[])
+
+        bb2 = CFGBlock(ID(), Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(5)))])
+        @test Mooncake.terminator(bb2) === bb2.insts[end].stmt
+    end
+    @testset "insert_before_terminator" begin
+        extra = Mooncake.IDInstPair[(ID(), new_inst(nothing))]
+
+        # No terminator: `extra` is appended at the end, and the input is left untouched.
+        hello = (ID(), new_inst(:(println("hello"))))
+        insts = Mooncake.IDInstPair[hello]
+        out = Mooncake.insert_before_terminator(insts, extra)
+        @test length(out) == 2
+        @test out[end] == extra[1]
+        @test insts !== out  # a fresh vector is returned
+        @test insts == Mooncake.IDInstPair[hello]  # input not modified (purity contract)
+
+        # Empty `insts`: exercises the `isempty(insts)` short-circuit; `extra` is appended.
+        out = Mooncake.insert_before_terminator(Mooncake.IDInstPair[], extra)
+        @test out == extra
+
+        # Terminator present: `extra` is spliced in immediately before it.
+        ret = (ID(), new_inst(ReturnNode(5)))
+        insts = Mooncake.IDInstPair[(ID(), new_inst(:(println("hello")))), ret]
+        out = Mooncake.insert_before_terminator(insts, extra)
+        @test length(out) == 3
+        @test out[end] == ret
+        @test out[end - 1] == extra[1]
+
+        @test Mooncake.insert_before_terminator(insts, Mooncake.IDInstPair[]) === insts
+
+        # Block led by a phi node: `extra` splices before the terminator, phi left in place.
+        phi = (ID(), new_inst(IDPhiNode([ID()], Any[true])))
+        insts = Mooncake.IDInstPair[phi, ret]
+        out = Mooncake.insert_before_terminator(insts, extra)
+        @test out[1] === phi
+        @test out[end] === ret
+        @test out[end - 1] == extra[1]
+    end
+    @testset "round-trip $f" for (f, P) in [
+        (TestResources.test_while_loop, Tuple{Float64}),
+        (sin, Tuple{Float64}),
+        (CFGBlocksTestCases.test_phi_node, Tuple{Ref{Union{Float32,Float64}}}),
+    ]
+        ir = Base.code_ircode(f, P)[1][1]
+        blocks = _ircode_to_cfg_blocks(ir)
+        @test blocks isa Vector{CFGBlock}
+        @test length(blocks) == length(ir.cfg.blocks)
+        new_ir = lower_cfg_blocks_to_ir(blocks, ir)
+        @test new_ir.argtypes isa Vector{Any}
+        @test new_ir.argtypes == ir.argtypes
+        @test length(stmt(new_ir.stmts)) == length(stmt(ir.stmts))
+        @test all(map(==, stmt(ir.stmts), stmt(new_ir.stmts)))
+        @test all(map(==, ir.stmts.type, new_ir.stmts.type))
+        @test all(map(==, ir.stmts.info, new_ir.stmts.info))
+        @test all(map(==, ir.stmts.line, new_ir.stmts.line))
+        @test all(map(==, ir.stmts.flag, new_ir.stmts.flag))
+        @test length(Mooncake.collect_stmts(blocks)) == length(stmt(ir.stmts))
+        @test Mooncake.id_to_line_map(blocks) isa Dict{ID,Int}
+    end
+    @testset "lower_cfg_blocks_to_ir argtypes coercion" begin
+        ir = Base.code_ircode(sin, Tuple{Float64})[1][1]
+        blocks = _ircode_to_cfg_blocks(ir)
+        custom = DataType[typeof(sin), Float64]
+        out = lower_cfg_blocks_to_ir(blocks, ir; argtypes=custom)
+        @test out.argtypes isa Vector{Any}
+        @test out.argtypes == Any[typeof(sin), Float64]
+    end
+    @static if VERSION > v"1.12-"
+        @testset "codelocs consistent after instruction insertion" begin
+            # In 1.12+ codelocs and stmts.line pack 3 Int32 per instruction, so an n-stmt
+            # IRCode has 3n entries which must stay aligned (Mooncake.jl#1216).
+            ir = Base.code_ircode(sin, Tuple{Float64})[1][1]
+            n_orig = length(ir.stmts)
+            orig_ir_codelocs = copy(ir.debuginfo.codelocs)
+            blocks = _ircode_to_cfg_blocks(ir)
+
+            # Insert a recognisable instruction before the first block's terminator.
+            blk = blocks[1]
+            insert_idx = if isnothing(Mooncake.terminator(blk))
+                length(blk.insts) + 1
+            else
+                length(blk.insts)
+            end
+            sentinel = (Int32(123), Int32(45), Int32(6))
+            inst = CC.NewInstruction(
+                nothing, Any, CC.NoCallInfo(), sentinel, CC.IR_FLAG_REFINED
+            )
+            blocks[1] = CFGBlock(
+                blk.id,
+                Mooncake.insert_before_terminator(
+                    Mooncake.collect_stmts(blk), Mooncake.IDInstPair[(ID(), inst)]
+                ),
+            )
+            new_ir = lower_cfg_blocks_to_ir(blocks, ir)
+            n = length(new_ir.stmts)
+            insert_range = (3insert_idx - 2):(3insert_idx)
+
+            @test n == n_orig + 1
+            @test length(new_ir.stmts.line) == 3n
+            @test length(new_ir.debuginfo.codelocs) == 3n
+            @test Tuple(new_ir.stmts.line[insert_range]) == sentinel
+            # Conversion must not mutate the source `ir`'s debug info.
+            @test new_ir.debuginfo.codelocs !== ir.debuginfo.codelocs
+            @test ir.debuginfo.codelocs == orig_ir_codelocs
+        end
+    end
+    @testset "control_flow_graph" begin
+        ir = Base.code_ircode_by_type(Tuple{typeof(sin),Float64})[1][1]
+        blocks = _ircode_to_cfg_blocks(ir)
+        cfg = Mooncake.control_flow_graph(blocks)
+        @test all(map((l, r) -> l.stmts == r.stmts, ir.cfg.blocks, cfg.blocks))
+        @test all(map((l, r) -> sort(l.preds) == sort(r.preds), ir.cfg.blocks, cfg.blocks))
+        @test all(map((l, r) -> sort(l.succs) == sort(r.succs), ir.cfg.blocks, cfg.blocks))
+        @test ir.cfg.index == cfg.index
+    end
+    @testset "_characterise_unique_predecessor_blocks" begin
+        @testset "single block" begin
+            blk_id = ID()
+            blks = CFGBlock[CFGBlock(blk_id, [ID()], [new_inst(ReturnNode(5))])]
+            upreds, pred_is_upred = _characterise_unique_predecessor_blocks(blks)
+            @test upreds[blk_id] == true
+            @test pred_is_upred[blk_id] == true
+        end
+        @testset "pair of blocks" begin
+            blk_id_1 = ID()
+            blk_id_2 = ID()
+            blks = CFGBlock[
+                CFGBlock(blk_id_1, [ID()], [new_inst(IDGotoNode(blk_id_2))]),
+                CFGBlock(blk_id_2, [ID()], [new_inst(ReturnNode(5))]),
+            ]
+            upreds, pred_is_upred = _characterise_unique_predecessor_blocks(blks)
+            @test upreds[blk_id_1] == true
+            @test upreds[blk_id_2] == true
+            @test pred_is_upred[blk_id_1] == true
+            @test pred_is_upred[blk_id_2] == true
+        end
+        @testset "Non-Unique Exit Node" begin
+            blk_id_1 = ID()
+            blk_id_2 = ID()
+            blk_id_3 = ID()
+            blks = CFGBlock[
+                CFGBlock(blk_id_1, [ID()], [new_inst(IDGotoIfNot(true, blk_id_3))]),
+                CFGBlock(blk_id_2, [ID()], [new_inst(ReturnNode(5))]),
+                CFGBlock(blk_id_3, [ID()], [new_inst(ReturnNode(5))]),
+            ]
+            upreds, pred_is_upred = _characterise_unique_predecessor_blocks(blks)
+            @test upreds[blk_id_1] == true
+            @test upreds[blk_id_2] == false
+            @test upreds[blk_id_3] == false
+            @test pred_is_upred[blk_id_1] == true
+            @test pred_is_upred[blk_id_2] == true
+            @test pred_is_upred[blk_id_3] == true
+        end
+        @testset "diamond structure of four blocks" begin
+            blk_id_1 = ID()
+            blk_id_2 = ID()
+            blk_id_3 = ID()
+            blk_id_4 = ID()
+            blks = CFGBlock[
+                CFGBlock(blk_id_1, [ID()], [new_inst(IDGotoIfNot(true, blk_id_3))]),
+                CFGBlock(blk_id_2, [ID()], [new_inst(IDGotoNode(blk_id_4))]),
+                CFGBlock(blk_id_3, [ID()], [new_inst(IDGotoNode(blk_id_4))]),
+                CFGBlock(blk_id_4, [ID()], [new_inst(ReturnNode(0))]),
+            ]
+            upreds, pred_is_upred = _characterise_unique_predecessor_blocks(blks)
+            @test upreds[blk_id_1] == true
+            @test upreds[blk_id_2] == false
+            @test upreds[blk_id_3] == false
+            @test upreds[blk_id_4] == true
+            @test pred_is_upred[blk_id_1] == true
+            @test pred_is_upred[blk_id_2] == true
+            @test pred_is_upred[blk_id_3] == true
+            @test pred_is_upred[blk_id_4] == false
+        end
+        @testset "simple loop back to first block" begin
+            blk_id_1 = ID()
+            blk_id_2 = ID()
+            blks = CFGBlock[
+                CFGBlock(blk_id_1, [ID()], [new_inst(IDGotoIfNot(true, blk_id_1))]),
+                CFGBlock(blk_id_2, [ID()], [new_inst(ReturnNode(5))]),
+            ]
+            upreds, pred_is_upred = _characterise_unique_predecessor_blocks(blks)
+            @test upreds[blk_id_1] == true
+            @test upreds[blk_id_2] == true
+            @test pred_is_upred[blk_id_1] == false
+            @test pred_is_upred[blk_id_2] == true
+        end
+    end
+    @testset "characterise_used_ids" begin
+        @testset "_find_id_uses!" begin
+            @testset "Expr" begin
+                id = ID()
+                d = Dict{ID,Bool}(id => false)
+                Mooncake._find_id_uses!(d, Expr(:call, sin, 5))
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, Expr(:call, sin, id))
+                @test d[id] == true
+            end
+            @testset "IDGotoIfNot" begin
+                id = ID()
+                d = Dict{ID,Bool}(id => false)
+                Mooncake._find_id_uses!(d, IDGotoIfNot(ID(), ID()))
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, IDGotoIfNot(true, ID()))
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, IDGotoIfNot(id, ID()))
+                @test d[id] == true
+            end
+            @testset "IDGotoNode" begin
+                id = ID()
+                d = Dict{ID,Bool}(id => false)
+                Mooncake._find_id_uses!(d, IDGotoNode(ID()))
+                @test d[id] == false
+            end
+            @testset "IDPhiNode" begin
+                id = ID()
+                d = Dict{ID,Bool}(id => false)
+                Mooncake._find_id_uses!(d, IDPhiNode([ID()], Vector{Any}(undef, 1)))
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, IDPhiNode([ID()], Any[id]))
+                @test d[id] == true
+            end
+            @testset "PiNode" begin
+                id = ID()
+                d = Dict{ID,Bool}(id => false)
+                Mooncake._find_id_uses!(d, PiNode(false, Bool))
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, PiNode(id, Bool))
+                @test d[id] == true
+            end
+            @testset "ReturnNode" begin
+                id = ID()
+                d = Dict{ID,Bool}(id => false)
+                Mooncake._find_id_uses!(d, ReturnNode())
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, ReturnNode(5))
+                @test d[id] == false
+                Mooncake._find_id_uses!(d, ReturnNode(id))
+                @test d[id] == true
+            end
+        end
+        @testset "some used some unused" begin
+            id_1 = ID()
+            id_2 = ID()
+            id_3 = ID()
+            stmts = Tuple{ID,Core.Compiler.NewInstruction}[
+                (id_1, new_inst(Expr(:call, sin, Argument(1)))),
+                (id_2, new_inst(Expr(:call, cos, id_1))),
+                (id_3, new_inst(ReturnNode(id_2))),
+            ]
+            result = characterise_used_ids(stmts)
+            @test result[id_1] == true
+            @test result[id_2] == true
+            @test result[id_3] == false
+        end
+    end
+    @testset "_is_reachable" begin
+        ir = Mooncake.ircode(
+            Any[
+                ReturnNode(nothing),
+                Expr(:call, sin, 5),
+                Core.GotoNode(4),
+                ReturnNode(SSAValue(2)),
+            ],
+            Any[Any for _ in 1:4],
+        )
+        @test Mooncake._is_reachable(_ircode_to_cfg_blocks(ir)) == [true, false, false]
+    end
+    @testset "_remove_unreachable_cfg_blocks!" begin
+
+        # This test case has two important features:
+        # 1. the second basic block (the second statement) cannot be reached, and
+        # 2. the PhiNode in the third basic block refers to the second basic block. Since
+        #   the second block will be removed, the edge / value in the PhiNode corresponding
+        #   to the second block must be removed as part of the call to
+        #   _remove_unreachable_cfg_blocks!.
+        ir = Mooncake.ircode(
+            Any[
+                GotoNode(3),
+                nothing,
+                PhiNode(Int32[2, 1], Any[false, true]),
+                ReturnNode(SSAValue(3)),
+            ],
+            Any[Any for _ in 1:4],
+        )
+        CC.verify_ir(ir)
+        blocks = _ircode_to_cfg_blocks(ir)
+        new_blocks = Mooncake._remove_unreachable_cfg_blocks!(blocks)
+
+        # Surviving blocks are shared with the input; their phi edges are mutated in place.
+        @test new_blocks !== blocks
+        @test length(blocks) == 3
+        @test blocks[3] === new_blocks[2]
+
+        # Check that only the first and third block remain in the new IR.
+        @test length(new_blocks) == 2
+        @test blocks[1].id == new_blocks[1].id
+        @test blocks[3].id == new_blocks[2].id
+
+        # Check that the reference to the second block in the PhiNode has been removed.
+        updated_id_phi_node = new_blocks[2].insts[1].stmt
+        @test length(updated_id_phi_node.edges) == 1
+        @test length(updated_id_phi_node.values) == 1
+        @test only(updated_id_phi_node.values) == true
+
+        # Get the IRCode, and ensure that the statements in it agree with what is expected.
+        new_ir = lower_cfg_blocks_to_ir(new_blocks, ir)
+        expected_stmts = Any[
+            GotoNode(2), PhiNode(Int32[1], Any[true]), ReturnNode(SSAValue(2))
+        ]
+        @test Mooncake.stmt(new_ir.stmts) == expected_stmts
+    end
+    @testset "Switch lowering" begin
+        # The conds/dests length invariant is enforced.
+        @test_throws AssertionError Mooncake.Switch(Any[true], ID[ID(), ID()], ID())
+
+        d1, d2, fallthrough = ID(), ID(), ID()
+        sw = Mooncake.Switch(Any[true, false], ID[d1, d2], fallthrough)
+        blk_id = ID()
+        blks = CFGBlock[
+            CFGBlock(
+                blk_id, Mooncake.IDInstPair[(ID(), new_inst(nothing)), (ID(), new_inst(sw))]
+            ),
+            CFGBlock(d1, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(1)))]),
+            CFGBlock(d2, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(2)))]),
+            CFGBlock(fallthrough, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(3)))]),
+        ]
+
+        # A Switch block has all dests plus the fallthrough as successors.
+        @test Mooncake._compute_cfg_successors(blks)[blk_id] == ID[d1, d2, fallthrough]
+
+        lowered = Mooncake._cfg_lower_switch_statements(blks)
+        @test length(lowered) == length(blks) + 3
+        @test lowered[1].id == blk_id
+        @test Mooncake.terminator(lowered[1]) === nothing  # Switch stripped
+        t_d1 = Mooncake.terminator(lowered[2])
+        @test t_d1 isa IDGotoIfNot && t_d1.cond == true && t_d1.dest == d1
+        t_d2 = Mooncake.terminator(lowered[3])
+        @test t_d2 isa IDGotoIfNot && t_d2.cond == false && t_d2.dest == d2
+        t_ft = Mooncake.terminator(lowered[4])
+        @test t_ft isa IDGotoNode && t_ft.label == fallthrough
+    end
+    @testset "_cfg_remove_double_edges" begin
+        # An IDGotoIfNot whose dest is the immediate next block collapses to an IDGotoNode.
+        b2 = ID()
+        blks = CFGBlock[
+            CFGBlock(ID(), Mooncake.IDInstPair[(ID(), new_inst(IDGotoIfNot(true, b2)))]),
+            CFGBlock(b2, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(5)))]),
+        ]
+        t = Mooncake.terminator(Mooncake._cfg_remove_double_edges(blks)[1])
+        @test t isa IDGotoNode && t.label == b2
+
+        # A branch to a non-successor block is left unchanged (same object returned).
+        elsewhere = ID()
+        blkA = CFGBlock(
+            ID(), Mooncake.IDInstPair[(ID(), new_inst(IDGotoIfNot(true, elsewhere)))]
+        )
+        blks2 = CFGBlock[
+            blkA, CFGBlock(ID(), Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(1)))])
+        ]
+        @test Mooncake._cfg_remove_double_edges(blks2)[1] === blkA
+    end
+    @testset "_sort_cfg_blocks!" begin
+        entry, a, b, c = ID(), ID(), ID(), ID()
+        # Input out of order; `a` and `b` are both unreachable (distance typemax).
+        blks = CFGBlock[
+            CFGBlock(entry, Mooncake.IDInstPair[(ID(), new_inst(IDGotoNode(c)))]),
+            CFGBlock(a, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(1)))]),
+            CFGBlock(b, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(2)))]),
+            CFGBlock(c, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(3)))]),
+        ]
+        out = Mooncake._sort_cfg_blocks!(blks)
+        @test out === blks                      # mutates and returns the same vector
+        @test out[1].id == entry                # entry (distance 0) first
+        @test out[2].id == c                    # reachable (distance 1) before unreachables
+        @test Set([out[3].id, out[4].id]) == Set([a, b])  # both unreachable blocks land last
+
+        # Ordering must follow increasing distance-from-entry, not input position.
+        e2, x, y = ID(), ID(), ID()
+        chain = CFGBlock[
+            CFGBlock(e2, Mooncake.IDInstPair[(ID(), new_inst(IDGotoNode(x)))]),  # distance 0
+            CFGBlock(y, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(0)))]),   # distance 2
+            CFGBlock(x, Mooncake.IDInstPair[(ID(), new_inst(IDGotoNode(y)))]),   # distance 1
+        ]
+        @test [blk.id for blk in Mooncake._sort_cfg_blocks!(chain)] == [e2, x, y]
+    end
+    @testset "_distance_to_entry (back-edge / cycle)" begin
+        # The BFS must not re-queue or overwrite a block reached via a back-edge.
+        header, body, unreachable = ID(), ID(), ID()
+        blks = CFGBlock[
+            # header branches to itself (back-edge) and falls through to body.
+            CFGBlock(
+                header, Mooncake.IDInstPair[(ID(), new_inst(IDGotoIfNot(true, header)))]
+            ),
+            CFGBlock(body, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(1)))]),
+            CFGBlock(unreachable, Mooncake.IDInstPair[(ID(), new_inst(ReturnNode(2)))]),
+        ]
+        d = Mooncake._distance_to_entry(blks)
+        @test d[1] == 0                # header stays distance 0 despite the self back-edge
+        @test d[2] == 1                # body reached via fallthrough
+        @test d[3] == typemax(Int)     # unreachable
+        @test Mooncake._is_reachable(blks) == [true, true, false]
+    end
+    @testset "new_inst defaults" begin
+        ni = new_inst(nothing, Float64)
+        @test ni.stmt === nothing
+        @test ni.type === Float64
+        @test ni.info isa CC.NoCallInfo
+        @test ni.flag == CC.IR_FLAG_REFINED
+        @test new_inst(nothing; noinline=true).flag ==
+            CC.IR_FLAG_REFINED | CC.IR_FLAG_NOINLINE
+    end
+    @testset "is_reachable_return_node" begin
+        @test Mooncake.is_reachable_return_node(ReturnNode(5)) == true
+        @test Mooncake.is_reachable_return_node(ReturnNode()) == false
+        @test Mooncake.is_reachable_return_node(IDGotoNode(ID())) == false
+    end
+    @testset "seed_id!" begin
+        # Reseeding restores determinism: IDs created after each reset match (same thread).
+        Mooncake.seed_id!()
+        a = ID()
+        Mooncake.seed_id!()
+        b = ID()
+        @test a == b
+        @test a.id == 0
     end
 end

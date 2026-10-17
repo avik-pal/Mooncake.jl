@@ -1,17 +1,8 @@
-using Aqua,
-    BenchmarkTools,
-    DiffRules,
-    JET,
-    JuliaFormatter,
-    LinearAlgebra,
-    Logging,
-    Random,
-    StableRNGs,
-    Mooncake,
-    Test
+using Aqua, BenchmarkTools, JET, LinearAlgebra, Logging, Random, StableRNGs, Mooncake, Test
 
 using AllocCheck: AllocCheck # load to enable testing functionality
 
+using ChainRules
 using ChainRulesCore: ChainRulesCore
 
 using Base: unsafe_load, pointer_from_objref, IEEEFloat, TwicePrecision
@@ -19,7 +10,6 @@ using Base.Iterators: product
 using Core:
     bitcast, svec, ReturnNode, PhiNode, PiNode, GotoIfNot, GotoNode, SSAValue, Argument
 using Core.Intrinsics: pointerref, pointerset
-using FunctionWrappers: FunctionWrapper
 
 using Mooncake
 
@@ -37,13 +27,14 @@ using Mooncake:
     zero_tangent,
     _scale,
     _add_to_primal,
-    _diff,
     _dot,
+    Dual,
     zero_dual,
     zero_codual,
     codual_type,
     rrule!!,
     build_rrule,
+    build_frule,
     value_and_gradient!!,
     value_and_pullback!!,
     NoFData,
@@ -55,7 +46,9 @@ using Mooncake:
     get_interpreter,
     Mode,
     ForwardMode,
-    ReverseMode
+    ReverseMode,
+    MistyClosureTangent,
+    dual_type
 
 using Mooncake:
     CC,
@@ -69,12 +62,13 @@ using Mooncake:
     lsetfield!,
     Stack,
     _typeof,
-    BBCode,
+    _ircode_to_cfg_blocks,
+    lower_cfg_blocks_to_ir,
     ID,
     IDPhiNode,
     IDGotoNode,
     IDGotoIfNot,
-    BBlock,
+    CFGBlock,
     make_ad_stmts!,
     ADStmtInfo,
     ad_stmt_info,
@@ -90,7 +84,7 @@ using Mooncake:
     LazyZeroRData,
     lazy_zero_rdata,
     new_inst,
-    characterise_unique_predecessor_blocks,
+    _characterise_unique_predecessor_blocks,
     NoPullback,
     characterise_used_ids,
     InvalidFDataException,

@@ -45,7 +45,7 @@ versions of methods which can be successfully differentiated by Mooncake if the 
 cannot be.
 
 For example, suppose that you have a function
-```jldoctest overlay
+```jldoctest overlay; setup = :(using Mooncake)
 julia> foo(x::Float64) = bar(x)
 foo (generic function with 1 method)
 ```
@@ -53,7 +53,7 @@ where Mooncake.jl fails to differentiate `bar` for some reason.
 If you have access to another function `baz`, which does the same thing as `bar`, but does
     so in a way which Mooncake.jl can differentiate, you can simply write:
 ```jldoctest overlay
-julia> Mooncake.@mooncake_overlay foo(x::Float64) = baz(x)
+julia> Mooncake.@mooncake_overlay foo(x::Float64) = baz(x);
 
 ```
 When looking up the code for `foo(::Float64)`, Mooncake.jl will see this method, rather than
@@ -67,7 +67,7 @@ answer that Mooncake.jl gives changes if you change the definition of a function
 Do not do this in practice -- this is just a simple way to demonostrate how to use overlays!
 
 First, consider a simple example:
-```jldoctest overlay-doctest
+```jldoctest overlay-doctest; setup = :(using Mooncake)
 julia> scale(x) = 2x
 scale (generic function with 1 method)
 
@@ -78,8 +78,8 @@ julia> Mooncake.value_and_gradient!!(rule, scale, 5.0)
 ```
 
 We can use `@mooncake_overlay` to change the definition which Mooncake.jl sees:
-```jldoctest overlay-doctest
-julia> Mooncake.@mooncake_overlay scale(x) = 3x
+```jldoctest overlay-doctest; setup = :(using Mooncake)
+julia> Mooncake.@mooncake_overlay scale(x) = 3x;
 
 julia> rule = Mooncake.build_rrule(Tuple{typeof(scale), Float64});
 
@@ -90,16 +90,22 @@ As can be seen from the output, the result of differentiating using Mooncake.jl 
 to reflect the overlay-ed definition of the method.
 
 Additionally, it is possible to use the usual multi-line syntax to declare an overlay:
-```jldoctest overlay-doctest
+```jldoctest overlay-doctest; setup = :(using Mooncake)
 julia> Mooncake.@mooncake_overlay function scale(x)
            return 4x
-       end
+       end;
 
 julia> rule = Mooncake.build_rrule(Tuple{typeof(scale), Float64});
 
 julia> Mooncake.value_and_gradient!!(rule, scale, 5.0)
 (20.0, (NoTangent(), 4.0))
 ```
+
+!!! warning "Combining with `@is_primitive`"
+    Applying an overlay to a signature that is also marked as a primitive via
+    [`@is_primitive`](@ref) is not generally supported: type inference uses the
+    original body, so the rule and the inferred `CoDual` type can disagree.
+    See [Primitives and Overlays](@ref).
 """
 macro mooncake_overlay(method_expr)
     def = splitdef(method_expr)
@@ -126,13 +132,15 @@ NOTE: you should only make use of this function if you cannot make use of the
 
 You make use of this functionality by writing a method of `Mooncake.rrule!!`, and
 passing all of its arguments (including the function itself) to this function. For example:
-```jldoctest
+```jldoctest; setup = :(using Mooncake: NoRData)
 julia> import Mooncake: zero_adjoint, DefaultCtx, zero_fcodual, rrule!!, is_primitive, CoDual
 
 julia> foo(x::Vararg{Int}) = 5
 foo (generic function with 1 method)
 
-julia> is_primitive(::Type{DefaultCtx}, ::Type{<:Tuple{typeof(foo), Vararg{Int}}}) = true;
+julia> world = Base.get_world_counter();
+
+julia> is_primitive(::Type{DefaultCtx}, ::Type{<:Tuple{typeof(foo), Vararg{Int}}}, world) = true;
 
 julia> rrule!!(f::CoDual{typeof(foo)}, x::Vararg{CoDual{Int}}) = zero_adjoint(f, x...);
 
@@ -160,7 +168,7 @@ NOTE: you should only make use of this function if you cannot make use of the
 
 You make use of this functionality by writing a method of `Mooncake.frule!!`, and
 passing all of its arguments (including the function itself) to this function. For example:
-```jldoctest
+```jldoctest; setup = :(using Mooncake: NoRData)
 julia> import Mooncake: zero_derivative, DefaultCtx, zero_dual, frule!!, Dual
 
 julia> foo(x::Vararg{Int}) = 5
@@ -191,7 +199,7 @@ Users of ChainRules.jl should be familiar with this functionality -- it is moral
 as `ChainRulesCore.@non_differentiable`.
 
 For example:
-```jldoctest
+```jldoctest; setup = :(using Mooncake: NoRData)
 julia> using Mooncake: @zero_derivative, DefaultCtx, zero_dual, zero_fcodual, frule!!, rrule!!, is_primitive, ForwardMode, ReverseMode
 
 julia> foo(x) = 5
@@ -199,10 +207,10 @@ foo (generic function with 1 method)
 
 julia> @zero_derivative DefaultCtx Tuple{typeof(foo), Any}
 
-julia> is_primitive(DefaultCtx, ForwardMode, Tuple{typeof(foo), Any})
+julia> is_primitive(DefaultCtx, ForwardMode, Tuple{typeof(foo), Any}, Base.get_world_counter())
 true
 
-julia> is_primitive(DefaultCtx, ReverseMode, Tuple{typeof(foo), Any})
+julia> is_primitive(DefaultCtx, ReverseMode, Tuple{typeof(foo), Any}, Base.get_world_counter())
 true
 
 julia> frule!!(zero_dual(foo), zero_dual(3.0))
@@ -212,8 +220,8 @@ julia> rrule!!(zero_fcodual(foo), zero_fcodual(3.0))[2](NoRData())
 (NoRData(), 0.0)
 ```
 
-Limited support for `Vararg`s is also available. For example
-```jldoctest
+`Vararg` signatures are also supported. For example
+```jldoctest; setup = :(using Mooncake: NoRData)
 julia> using Mooncake: @zero_derivative, DefaultCtx, zero_fcodual, rrule!!, is_primitive, ReverseMode
 
 julia> foo_varargs(x...) = 5
@@ -221,15 +229,15 @@ foo_varargs (generic function with 1 method)
 
 julia> @zero_derivative DefaultCtx Tuple{typeof(foo_varargs), Vararg}
 
-julia> is_primitive(DefaultCtx, ReverseMode, Tuple{typeof(foo_varargs), Any, Float64, Int})
+julia> is_primitive(DefaultCtx, ReverseMode, Tuple{typeof(foo_varargs), Any, Float64, Int}, Base.get_world_counter())
 true
 
 julia> rrule!!(zero_fcodual(foo_varargs), zero_fcodual(3.0), zero_fcodual(5))[2](NoRData())
 (NoRData(), 0.0, NoRData())
 ```
-Be aware that it is not currently possible to specify any of the type parameters of the
-`Vararg`. For example, the signature `Tuple{typeof(foo), Vararg{Float64, 5}}` will not work
-with this macro.
+Typed and counted `Vararg`s are also supported. For example,
+`Tuple{typeof(foo), Vararg{Float64}}` constrains all vararg slots to `Float64`, and
+`Tuple{typeof(foo), Vararg{Float64, N}} where {N}` additionally constrains the count.
 
 WARNING: this is only correct if the output of the function does not alias any fields of the
 function, or any of its arguments. For example, applying this macro to the function `x -> x`
@@ -240,9 +248,8 @@ made a mistake.
 
 # Signatures Unsupported By This Macro
 
-If the signature you wish to apply `@zero_derivative` to is not supported, for example because
-it uses a `Vararg` with a type parameter, you can still make use of
-[`zero_derivative`](@ref).
+If the signature you wish to apply `@zero_derivative` to is not supported, you can still
+make use of [`zero_derivative`](@ref).
 
 """
 macro zero_derivative(ctx, sig, mode=Mode)
@@ -251,21 +258,64 @@ macro zero_derivative(ctx, sig, mode=Mode)
     return _zero_derivative_impl(ctx, sig, mode)
 end
 
+# Returns true if `ex` (an already-escaped expression from parse_signature_expr) is any
+# form of Vararg: bare `Vararg`, `Vararg{T}`, or `Vararg{T,N}`.
+function _is_vararg_expr(ex)
+    ex == Expr(:escape, :Vararg) && return true
+    return ex isa Expr &&
+           ex.head == :escape &&
+           ex.args[1] isa Expr &&
+           ex.args[1].head == :curly &&
+           ex.args[1].args[1] == :Vararg
+end
+
+# Given an escaped Vararg expression and a wrapper type symbol (e.g. :(Mooncake.Dual)),
+# produce the appropriate Vararg type for the rule signature:
+#   Vararg        -> Vararg{wrapper}
+#   Vararg{T}     -> Vararg{wrapper{<:T}}
+#   Vararg{T,N}   -> Vararg{wrapper{<:T},N}
+# The inner components T and N are individually re-escaped so they resolve in the
+# caller's scope (parse_signature_expr already escaped the whole arg as one unit).
+function _vararg_wrapped_type(vararg_esc_expr, wrapper)
+    inner = vararg_esc_expr.args[1]
+    # Bare `Vararg` maps to `Vararg{wrapper}` without `<:` — any Dual/CoDual matches,
+    # consistent with `Vararg` meaning `Vararg{Any}`.
+    inner == :Vararg && return :(Vararg{$wrapper})
+    # inner is Expr(:curly, :Vararg, T) or Expr(:curly, :Vararg, T, N)
+    T = Expr(:escape, inner.args[2])
+    length(inner.args) == 2 && return :(Vararg{$wrapper{<:$T}})
+    N = Expr(:escape, inner.args[3])
+    return :(Vararg{$wrapper{<:$T},$N})
+end
+
 function _zero_derivative_impl(ctx, sig, mode)
 
     # Parse the signature, and construct the rule definition. If it is a vararg definition,
     # then the last argument requires special treatment.
     arg_type_symbols, where_params = parse_signature_expr(sig)
     arg_names = map(n -> Symbol("x_$n"), eachindex(arg_type_symbols))
-    is_vararg = arg_type_symbols[end] == Expr(:escape, :Vararg)
+
+    # Detect Vararg in a non-last position, which is invalid Julia and would silently
+    # produce a broken rule. Return a throw expression (rather than throwing here) so that
+    # the error is raised at runtime and can be caught by @test_throws in tests.
+    for t in arg_type_symbols[1:(end - 1)]
+        if _is_vararg_expr(t)
+            msg =
+                "@zero_derivative: `Vararg` may only appear as the last element of " *
+                "the signature tuple, but got: $sig"
+            return :(throw(ArgumentError($msg)))
+        end
+    end
+
+    is_vararg = _is_vararg_expr(arg_type_symbols[end])
     if is_vararg
         arg_types_deriv = vcat(
             map(t -> :(Mooncake.Dual{<:$t}), arg_type_symbols[1:(end - 1)]),
-            :(Vararg{Mooncake.Dual}),
+            _vararg_wrapped_type(arg_type_symbols[end], :(Mooncake.Dual)),
         )
         arg_types_adjoint = vcat(
             map(t -> :(Mooncake.CoDual{<:$t}), arg_type_symbols[1:(end - 1)]),
-            :(Vararg{Mooncake.CoDual}),
+            _vararg_wrapped_type(arg_type_symbols[end], :(Mooncake.CoDual)),
         )
         splat_symbol = Expr(Symbol("..."), arg_names[end])
         tmp = arg_names[1:(end - 1)]
@@ -282,7 +332,7 @@ function _zero_derivative_impl(ctx, sig, mode)
     # which does not escape the mode argument. This will work even if the names `Mooncake`
     # or `Mooncake.Mode` are not available in the scope which calls this macro.
     is_primitive_ex = quote
-        function Mooncake.is_primitive(
+        function Mooncake._is_primitive(
             ::Type{$(esc(ctx))}, ::Type{<:$mode}, ::Type{<:$(esc(sig))}
         )
             return true
@@ -321,12 +371,21 @@ end
 Convert a Mooncake tangent into a type that ChainRules.jl `rrule`s expect to see.
 """
 to_cr_tangent(t::IEEEFloat) = t
+to_cr_tangent(t::Complex{<:IEEEFloat}) = t
 to_cr_tangent(t::Array{<:IEEEFloat}) = t
 to_cr_tangent(t::Array) = map(to_cr_tangent, t)
 to_cr_tangent(::NoTangent) = CRC.NoTangent()
 to_cr_tangent(t::Tangent) = CRC.Tangent{Any}(; map(to_cr_tangent, t.fields)...)
 to_cr_tangent(t::MutableTangent) = CRC.Tangent{Any}(; map(to_cr_tangent, t.fields)...)
 to_cr_tangent(t::Tuple) = CRC.Tangent{Any}(map(to_cr_tangent, t)...)
+to_cr_tangent(nt::NamedTuple) = CRC.Tangent{Any}(; map(to_cr_tangent, nt)...)
+function to_cr_tangent(x::PossiblyUninitTangent)
+    if is_init(x)
+        return to_cr_tangent(x.tangent)
+    else
+        return CRC.ZeroTangent()
+    end
+end
 
 function to_cr_tangent(t)
     throw(
@@ -359,6 +418,21 @@ function mooncake_tangent(p::P, t::T) where {P<:Tuple,T<:CRC.Tangent}
     return tangent_type(P) == NoTangent ? NoTangent() : map(mooncake_tangent, p, t.backing)
 end
 
+function mooncake_tangent(p::T, cr_tangent::T) where {P<:IEEEFloat,T<:Complex{P}}
+    return cr_tangent
+end
+
+# Convert `ChainRulesCore.NotImplemented` tangents to Mooncake-style `NaN` tangents.
+function mooncake_tangent(
+    p::T, cr_tangent::CRC.NotImplemented
+) where {P<:IEEEFloat,T<:Complex{P}}
+    return mooncake_tangent(p, T(P(NaN), P(NaN)))
+end
+
+function mooncake_tangent(p::T, cr_tangent::CRC.NotImplemented) where {T<:IEEEFloat}
+    return T(NaN)
+end
+
 function mooncake_tangent(p, cr_tangent)
     throw(
         ArgumentError(
@@ -378,14 +452,54 @@ end
 Increment `fdata` by the fdata component of the ChainRules.jl-style tangent, `cr_tangent`,
 and return the rdata component of `cr_tangent` by adding it to `zero_rdata`.
 """
-increment_and_get_rdata!(::NoFData, r::T, t::T) where {T<:IEEEFloat} = r + t
-function increment_and_get_rdata!(f::Array{P}, ::NoRData, t::Array{P}) where {P<:IEEEFloat}
+function increment_and_get_rdata!(
+    ::NoFData, r::T, t::T
+) where {T<:Union{IEEEFloat,Complex{<:IEEEFloat}}}
+    return r + t
+end
+# Plain arrays only: a view's fdata is the parent's, so views need a hand-written `rrule!!`.
+function increment_and_get_rdata!(
+    f::Array{P}, ::NoRData, t::Array{P}
+) where {P<:Union{IEEEFloat,Complex{<:IEEEFloat}}}
     increment!!(f, t)
     return NoRData()
 end
 increment_and_get_rdata!(::Any, r, ::CRC.NoTangent) = r
 function increment_and_get_rdata!(f, r, t::CRC.Thunk)
     return increment_and_get_rdata!(f, r, CRC.unthunk(t))
+end
+
+# Tuple tangents from ChainRulesCore require special handling because tuple elements
+# may be a mix of types: some with only rdata (e.g., scalars), some with only fdata
+# (e.g., arrays), and some with both. These four dispatches for increment_and_get_rdata!
+# handle all the possible cases for when the ChainRulesCore.Tangent has Tuple type data.
+function increment_and_get_rdata!(f, r, t::CRC.Tangent{P,<:Tuple}) where {P}
+    return increment_and_get_rdata!(f, r, t.backing)
+end
+function increment_and_get_rdata!(f::NoFData, r::Tuple, t::Tuple)
+    return map((ri, ti) -> increment_and_get_rdata!(f, ri, ti), r, t)
+end
+function increment_and_get_rdata!(f::Tuple, r::NoRData, t::Tuple)
+    increment!!(f, t)
+    return NoRData()
+end
+function increment_and_get_rdata!(f::Tuple, r::Tuple, t::Tuple)
+    return map((fi, ri, ti) -> increment_and_get_rdata!(fi, ri, ti), f, r, t)
+end
+
+# If a ChainRulesCore complex tangent is `NotImplemented`, return a `NaN`-filled Mooncake tangent.
+function increment_and_get_rdata!(
+    f::NoFData, r::Complex{T}, t::CRC.NotImplemented
+) where {T<:IEEEFloat}
+    return Complex(T(NaN), T(NaN))
+end
+
+function increment_and_get_rdata!(f, r::T, t::CRC.NotImplemented) where {T<:IEEEFloat}
+    return T(NaN)
+end
+
+function increment_and_get_rdata!(f::NoFData, r::NoRData, t::CRC.NotImplemented)
+    return NoTangent()
 end
 
 function increment_and_get_rdata!(f, r, t)
@@ -397,6 +511,93 @@ function increment_and_get_rdata!(f, r, t)
             "`increment_and_get_rdata!` to handle this type combination. " *
             "Consider writing a custom rrule!! for your function instead, " *
             "or implement a method of `increment_and_get_rdata!` for this type combination.",
+        ),
+    )
+end
+
+"""
+    nan_tangent_guard(dy::L, tangent::T) where {L,T}
+
+Guard against NaN propagation in automatic differentiation.  
+
+When `dy = 0`, the corresponding gradient does not contribute to the total  
+gradient, so a zero tangent is returned to prevent NaN poisoning.  
+
+Otherwise, return `tangent`.  
+
+Note that this does not fully eliminate gradient poisoning; it relies on  
+zero masking (i.e., a strong zero with `dy = 0`) to reduce NaN propagation.
+"""
+@inline function nan_tangent_guard(
+    dy::L, tangent::T
+) where {
+    L<:Union{Base.IEEEFloat,Complex{<:Base.IEEEFloat}},
+    T<:Union{Base.IEEEFloat,Complex{<:Base.IEEEFloat}},
+}
+    return if iszero(dy)
+        T(0)
+    else
+        tangent
+    end
+end
+
+"""
+    nondifferentiable_tangent_guard(dy::L, tangent::T) where {L,T}
+
+Handle functions evaluated at non-differentiable points in their domain. See:
+https://juliadiff.org/ChainRulesCore.jl/dev/maths/nondiff_points.html
+
+If `dy == 0`, the gradient contributes nothing to the total gradient
+calculation, so a zero tangent is returned.
+
+Otherwise, return the user-provided `tangent` (eg, NaN), which may 
+be used to signal the presence of a non-differentiable point.
+"""
+@inline function nondifferentiable_tangent_guard(
+    dy::L, tangent::T
+) where {
+    L<:Union{Base.IEEEFloat,Complex{<:Base.IEEEFloat}},
+    T<:Union{Base.IEEEFloat,Complex{<:Base.IEEEFloat}},
+}
+    return if iszero(dy)
+        T(0)
+    else
+        tangent
+    end
+end
+
+"""
+    notimplemented_tangent_guard(dy::Mooncake.Tangent)
+
+Guards the use of a tangent associated with a `ChainRulesCore.NotImplemented` derivative.
+
+If `dy` is nonzero, return a `NaN`-filled value matching the shape and type of `da`, which signals an unknown derivative.
+
+If `dy` is the zero tangent, return a zero-valued tangent in a form compatible with immediate algebraic composition inside Mooncake rules.
+
+This masking ensures that missing derivatives only affect results when they are mathematically required.
+
+!!! note
+    This function is defined only for floating-point and complex tangent spaces.
+    It cannot support `Int` tangents, since `NaN` is only defined for
+    `AbstractFloat` types.
+"""
+function notimplemented_tangent_guard(
+    dy::L
+) where {L<:Union{Base.IEEEFloat,Complex{<:Base.IEEEFloat}}}
+    return if _dot(dy, dy) != L(0)
+        L(NaN)
+    else
+        L(0)
+    end
+end
+
+function notimplemented_tangent_guard(dy)
+    throw(
+        ArgumentError(
+            "Mooncake.jl does not currently have a method of " *
+            "`notimplemented_tangent_guard` to handle the tangent type $(typeof(dy)). " *
+            "Please consider writing a custom notimplemented_tangent_guard or open an issue.",
         ),
     )
 end
@@ -525,7 +726,7 @@ Convenience functionality to assist in using `ChainRuleCore.frule`s and
 
 ## A Basic Example
 
-```jldoctest
+```jldoctest; setup = :(using Random: Xoshiro)
 julia> using Mooncake: @from_chainrules, DefaultCtx, frule!!, rrule!!, Dual, zero_dual, zero_fcodual, TestUtils
 
 julia> import ChainRulesCore
@@ -553,7 +754,7 @@ julia> # Check that the rule works as intended. Put this in your test suite.
 
 ## An Example with Keyword Arguments and ReverseMode
 
-```jldoctest
+```jldoctest; setup = :(using Random: Xoshiro)
 julia> using Mooncake: @from_chainrules, DefaultCtx, rrule!!, zero_fcodual, TestUtils, ReverseMode
 
 julia> import ChainRulesCore
@@ -626,6 +827,17 @@ case because the required method of either of these functions does not exist, pl
 issue.
 """
 macro from_chainrules(ctx, sig::Expr, has_kwargs::Bool=false, mode=Mode)
+    mode = mode == :ForwardMode ? ForwardMode : mode
+    mode = mode == :ReverseMode ? ReverseMode : mode
+    mode = mode == :Mode ? Mode : mode
+    if !(mode === Mode || mode === ForwardMode || mode === ReverseMode)
+        throw(
+            ArgumentError(
+                "@from_chainrules mode must be Mode, ForwardMode, or ReverseMode " *
+                "(use unqualified names); got $(mode)",
+            ),
+        )
+    end
     return _from_chainrules_impl(ctx, sig, has_kwargs, mode)
 end
 
@@ -634,56 +846,85 @@ function _from_chainrules_impl(ctx, sig::Expr, has_kwargs::Bool, mode)
     arg_names = map(n -> Symbol("x_$n"), eachindex(arg_type_syms))
     dual_arg_types = map(t -> :(Mooncake.Dual{<:$t}), arg_type_syms)
     codual_arg_types = map(t -> :(Mooncake.CoDual{<:$t}), arg_type_syms)
-    frule_expr = construct_frule_wrapper_def(arg_names, dual_arg_types, where_params)
-    rrule_expr = construct_rrule_wrapper_def(arg_names, codual_arg_types, where_params)
+
+    # Determine which rules to generate based on mode
+    include_frule = (mode === Mode) || (mode === ForwardMode)
+    include_rrule = (mode === Mode) || (mode === ReverseMode)
+
+    frule_expr = if include_frule
+        construct_frule_wrapper_def(arg_names, dual_arg_types, where_params)
+    else
+        nothing
+    end
+    rrule_expr = if include_rrule
+        construct_rrule_wrapper_def(arg_names, codual_arg_types, where_params)
+    else
+        nothing
+    end
 
     if has_kwargs
         kw_sig = Expr(:curly, :Tuple, :(typeof(Core.kwcall)), :NamedTuple, arg_type_syms...)
         kw_sig = where_params === nothing ? kw_sig : Expr(:where, kw_sig, where_params...)
         # Type M will be available later on, and will be the mode type.
         kw_is_primitive = quote
-            function Mooncake.is_primitive(
+            function Mooncake._is_primitive(
                 ::Type{$(esc(ctx))}, ::Type{<:$mode}, ::Type{<:$kw_sig}
             )
                 return true
             end
         end
-        kwargs_frule_expr = construct_frule_wrapper_def(
-            vcat(:_kwcall, :kwargs, arg_names),
-            vcat(
-                :(Mooncake.Dual{typeof(Core.kwcall)}),
-                :(Mooncake.Dual{<:NamedTuple}),
-                dual_arg_types,
-            ),
-            where_params,
-        )
-        kwargs_rrule_expr = construct_rrule_wrapper_def(
-            vcat(:_kwcall, :kwargs, arg_names),
-            vcat(
-                :(Mooncake.CoDual{typeof(Core.kwcall)}),
-                :(Mooncake.CoDual{<:NamedTuple}),
-                codual_arg_types,
-            ),
-            where_params,
-        )
+        kwargs_frule_expr = if include_frule
+            construct_frule_wrapper_def(
+                vcat(:_kwcall, :kwargs, arg_names),
+                vcat(
+                    :(Mooncake.Dual{typeof(Core.kwcall)}),
+                    :(Mooncake.Dual{<:NamedTuple}),
+                    dual_arg_types,
+                ),
+                where_params,
+            )
+        else
+            nothing
+        end
+        kwargs_rrule_expr = if include_rrule
+            construct_rrule_wrapper_def(
+                vcat(:_kwcall, :kwargs, arg_names),
+                vcat(
+                    :(Mooncake.CoDual{typeof(Core.kwcall)}),
+                    :(Mooncake.CoDual{<:NamedTuple}),
+                    codual_arg_types,
+                ),
+                where_params,
+            )
+        else
+            nothing
+        end
     else
         kw_is_primitive = nothing
         kwargs_frule_expr = nothing
         kwargs_rrule_expr = nothing
     end
 
-    return quote
-        function Mooncake.is_primitive(
+    is_primitive_expr = quote
+        function Mooncake._is_primitive(
             ::Type{$(esc(ctx))}, ::Type{<:$mode}, ::Type{<:($(esc(sig)))}
         )
             return true
         end
-        $frule_expr
-        $rrule_expr
-        $kw_is_primitive
-        $kwargs_frule_expr
-        $kwargs_rrule_expr
     end
+
+    exprs = filter(
+        !isnothing,
+        [
+            is_primitive_expr,
+            frule_expr,
+            rrule_expr,
+            kw_is_primitive,
+            kwargs_frule_expr,
+            kwargs_rrule_expr,
+        ],
+    )
+    return Expr(:block, exprs...)
 end
 
 """

@@ -38,7 +38,7 @@ function foo(x)
     return z
 end
 ```
-The communication between the two invocations of `bar` happen via the value it `return`s.
+The communication between the two invocations of `bar` happens via the value it `return`s.
 
 
 _**Modification of arguments**_
@@ -131,11 +131,11 @@ For our example, the exact form of ``f`` is
 ```math
 f((x, y, z, s)) = ((x, y, x \odot y, s), (2 x \odot y, \sum_{d=1}^D x \odot y))
 ```
-Observe that ``f`` behaves a little like a transition operator, in the that the first element of the tuple returned is the updated state of the arguments.
+Observe that ``f`` behaves a little like a transition operator, in that the first element of the tuple returned is the updated state of the arguments.
 
 This model is good enough for the vast majority of functions.
 Unfortunately it isn't sufficient to describe a `function` when arguments alias each other (e.g. consider the way in which this particular model is wrong if `y` aliases `z`).
-Fortunately this is only a problem in a small fraction of all cases of aliasing, so we defer discussion of this until later on.
+Fortunately this is only a problem in a small fraction of all cases of aliasing, so we defer discussion of this until the [Aliasing Invariant](@ref) section below.
 
 Consider now how this approach can be used to model several additional Julia functions, and to obtain their derivatives and adjoints.
 
@@ -156,7 +156,7 @@ function f!(x::Vector{Float64})
     return sum(x)
 end
 ```
-Our framework is able to accomodate this function, and has essentially the same solution as the last time we saw this example:
+Our framework is able to accommodate this function, and has essentially the same solution as the last time we saw this example:
 ```math
 f(x) = (x \odot x, \sum_{n=1}^N x_n^2)
 ```
@@ -191,7 +191,30 @@ D f [x]^\ast (\bar{y}) =  \bar{y}_1 + D \varphi [x]^\ast (\bar{y}_2).
 We see the correct thing to do is to increment the gradient of the output -- ``\bar{y}_1`` -- by the result of applying the adjoint of the derivative of ``\varphi`` to ``\bar{y}_2``.
 In a `ChainRules.rrule` the ``\bar{y}_1`` term is always zero, but the ``D \varphi [x]^\ast (\bar{y}_2)`` term is essentially the same.
 
+# The Rule Interface (Round 0)
 
+For anyone having interacted with Julia's AD ecosystem before, writing custom rules (if they are ever needed) should be relatively straightforward. 
+For functions which could have previously been handled via ChainRules.jl's `rrule` method (i.e. functions without mutation or keyword arguments), Mooncake's corresponding reverse mode rule will look very similar. 
+Translating one-to-one e.g. ChainRules.jl's reverse mode rule for `sin(x)`, which [in the original](https://juliadiff.org/ChainRulesCore.jl/stable/#Reverse-mode-AD-rules-(rrules)) reads like
+
+```julia
+function ChainRules.rrule(::typeof(sin), x)
+    sin_pullback(dy) = (ChainRules.NoTangent(), cos(x)' * dy)
+    return sin(x), sin_pullback
+end
+```
+becomes (compare also [Mooncake's own, slightly more efficient and restrictive/correct implementation](https://github.com/chalk-lab/Mooncake.jl/blob/05bbf164f0cbb86dfc28cd5650251edce3d6b646/src/rrules/low_level_maths.jl#L37-L42))
+
+```julia
+Mooncake.@is_primitive Mooncake.DefaultCtx Tuple{typeof(sin),Any}
+function Mooncake.rrule!!(::Mooncake.CoDual{typeof(sin)}, x::Mooncake.CoDual)
+    sin_pullback!!(dy) = (Mooncake.NoRData(), cos(x)' * dy)
+    return Mooncake.CoDual(sin(x), Mooncake.NoFData()), sin_pullback
+end
+```
+
+where we have added `ChainRules.` and `Mooncake.` explicitly. 
+In the coming sections, we will explain every part of Mooncake's reverse mode rules in more detail.
 
 # The Rule Interface (Round 1)
 
@@ -289,7 +312,7 @@ _**FData and RData**_
 While tangents are the things used to represent gradients and are what high-level interfaces will return, they are not what gets propagated forwards and backwards by rules during AD.
 
 Rather, during AD, Mooncake.jl makes a fundamental distinction between data which is identified by its address in memory (`Array`s, `mutable struct`s, etc), and data which is identified by its value (is-bits types such as `Float64`, `Int`, and `struct`s thereof).
-In particular, memory which is identified by its address gets assigned a unique location in memory in which its gradient lives (that this "unique gradient address" system is essential will become apparent when we discuss aliasing later on).
+In particular, memory which is identified by its address gets assigned a unique location in memory in which its gradient lives (that this "unique gradient address" system is essential will become apparent in the [Aliasing Invariant](@ref) section below).
 Conversely, the gradient w.r.t. a value type resides in another value type.
 
 The following docstring provides the best in-depth explanation.
@@ -307,6 +330,14 @@ _**CoDuals**_
 
 CoDuals are simply used to bundle together a primal and an associated fdata, depending upon context.
 Occassionally, they are used to pair together a primal and a tangent.
+
+### Aliasing Invariant
+
+The AD transform upholds the _aliasing invariant_: `primal(a) === primal(b)` implies `fdata(a) === fdata(b)`.
+In-place mutations accumulate into fdata buffers; two `CoDual`s with the same primal but different fdata buffers would diverge under mutation, producing wrong gradients.
+
+The invariant holds automatically in generated AD code.
+Custom rules that break it — constructing a `CoDual` with a primal already held by another live `CoDual` but a different fdata — must not allow the shared primal to be mutated in-place while both are live.
 
 _**A quick aside: Non-Differentiable Data**_
 
@@ -354,7 +385,7 @@ Now, following our usual steps, the derivative is
 ```math
 D f [x](\dot{x}) = (\dot{x}, \dot{x}_1 + \sum_{n=1}^N (\dot{x}_2)_n)
 ```
-A gradient for this is a tuple ``(\bar{y}_x, \bar{y}_a)`` where ``\bar{y}_a \in \RR`` and ``\bar{y}_x \in \RR \times \RR^N``.
+A gradient for this is a tuple ``\bar{y} = (\bar{y}_x, \bar{y}_a)`` where ``\bar{y}_a \in \RR`` and ``\bar{y}_x \in \RR \times \RR^N``.
 A quick derivation will show that the adjoint is
 ```math
 D f [x]^\ast(\bar{y}) = ((\bar{y}_x)_1 + \bar{y}_a, (\bar{y}_x)_2 + \bar{y}_a \mathbf{1})
@@ -382,13 +413,30 @@ julia> function rrule!!(::CoDual{typeof(foo)}, x::CoDual{Tuple{Float64, Vector{F
 where `dy` is the rdata for the output to `foo`.
 The `rrule!!` can be called with the appropriate `CoDual`s:
 ```jldoctest foo-doctest
-julia> out, pb!! = rrule!!(CoDual(foo, NoFData()), CoDual((5.0, [1.0, 2.0]), (NoFData(), [0.0, 0.0])))
-(CoDual{Float64, NoFData}(8.0, NoFData()), var"#dfoo_adjoint#1"{Tuple{NoFData, Vector{Float64}}}((NoFData(), [0.0, 0.0])))
+julia> codual_foo = CoDual(foo, NoFData());
+
+julia> codual_x = CoDual((5.0, [1.0, 2.0]), (NoFData(), [0.0, 0.0]));
+
+julia> out, pb!! = rrule!!(codual_foo, codual_x);
+
+julia> out
+CoDual{Float64, NoFData}(8.0, NoFData())
+
+julia> pb!! isa Function
+true
 ```
+
 and the pullback with appropriate rdata:
 ```jldoctest foo-doctest
 julia> pb!!(1.0)
 (NoRData(), (1.0, NoRData()))
+```
+
+which will update the fdata for the `Vector{Float64}` component in-place:
+
+```jldoctest foo-doctest
+julia> codual_x
+CoDual{Tuple{Float64, Vector{Float64}}, Tuple{NoFData, Vector{Float64}}}((5.0, [1.0, 2.0]), (NoFData(), [1.0, 1.0]))
 ```
 
 ```@meta
@@ -404,13 +452,13 @@ It's just book-keeping and running the primal computation.
 
 The reverse pass:
 1. increments each element of `dx_fdata[2]` by `dy` -- this corresponds to ``(\bar{y}_x)_2 + \bar{y}_a \mathbf{1}`` in the adjoint,
-2. sets `dx_1_rdata` to `dy` -- this corresponds ``(\bar{y}_x)_1 + \bar{y}_a`` subject to the constraint that ``(\bar{y}_x)_1 = 0``,
+2. sets `dx_1_rdata` to `dy` -- this corresponds to ``(\bar{y}_x)_1 + \bar{y}_a`` subject to the constraint that ``(\bar{y}_x)_1 = 0``,
 3. constructs the rdata for `x` -- this is essentially just book-keeping.
 
 Each of these items serve to demonstrate more general points.
-The first that, upon entry into the reverse pass, all fdata values correspond to gradients for the arguments / output of `f` "upon exit" (for the components of these which are identified by their address), and once the reverse-pass finishes running, they must contain the gradients w.r.t. the arguments of `f` "upon entry".
+The first is that, upon entry into the reverse pass, all fdata values correspond to gradients for the arguments / output of `f` "upon exit" (for the components of these which are identified by their address), and once the reverse-pass finishes running, they must contain the gradients w.r.t. the arguments of `f` "upon entry".
 
-The second that we always assume that the components of ``\bar{y}_x`` which are identified by their value have zero-rdata.
+The second is that we always assume that the components of ``\bar{y}_x`` which are identified by their value have zero-rdata.
 
 The third is that the components of the arguments of `f` which are identified by their value must have rdata passed back explicitly by a rule, while the components of the arguments to `f` which are identified by their address get their gradients propagated back implicitly (i.e. via the in-place modification of fdata).
 
@@ -418,12 +466,10 @@ _**Reminder**_: the first element of the tuple returned by `dfoo_adjoint` is the
 
 # Testing
 
-Mooncake.jl has an almost entirely automated system for testing rules -- `Mooncake.TestUtils.test_rule`.
-You should absolutely make use of these when writing rules.
-
-TODO: improve docstring for testing functionality.
-
-
+Mooncake.jl has an almost entirely automated system for testing rules -- [`Mooncake.TestUtils.test_rule`](@ref).
+You should absolutely make use of these when writing rules. This function can test both forward and backward modes,
+or you can specify a single mode to test. `test_rule` will also optionally test the performance of your rules.
+See the docstring for `test_rule` for more information.
 
 # Summary
 
@@ -466,10 +512,10 @@ function foo(x)
     return bar
 end
 bar = foo(randn(5))
-typeof(bar)
+fieldtypes(typeof(bar))
 
 # output
-var"#bar#1"{Vector{Float64}}
+(Vector{Float64},)
 ```
 Observe that the `Vector{Float64}` that we passed to `foo`, and closed over in `bar`, is present in the type.
 This alludes to the fact that closures are basically just callable `struct`s whose fields are the closed-over variables.

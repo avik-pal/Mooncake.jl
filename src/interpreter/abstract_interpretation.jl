@@ -2,7 +2,7 @@
 # in conjunction with the contexts above to decide what should be inlined and what should
 # not be inlined. Similar strategies are employed by Enzyme and Diffractor.
 
-# The most important bit of this code is `inlining_policy` -- the rest is copy + pasted
+# The most important bit of this code is `inlining_policy` (renamed to `src_inlining_policy` in Julia v1.12+) -- the rest is copy + pasted
 # boiler plate, largely taken from https://github.com/JuliaLang/julia/blob/2fe4190b3d26b4eee52b2b1b1054ddd6e38a941e/test/compiler/newinterp.jl#L11
 #
 # Credit: much of the code in here is copied over from the main Julia repo, and from
@@ -20,6 +20,7 @@ struct MooncakeCache
 end
 
 MooncakeCache() = MooncakeCache(IdDict{Core.MethodInstance,Core.CodeInstance}())
+Base.empty!(c::MooncakeCache) = (empty!(c.dict); c)
 
 # The method table used by `Mooncake.@mooncake_overlay`.
 Base.Experimental.@MethodTable mooncake_method_table
@@ -72,8 +73,8 @@ function Base.show(io::IO, mime::MIME"text/plain", mc::MooncakeInterpreter)
 end
 Base.show(io::IO, mc::MooncakeInterpreter) = _show_interp(io, MIME"text/plain"(), mc)
 
-function _show_interp(io::IO, ::MIME"text/plain", ::MooncakeInterpreter)
-    return print(io, "MooncakeInterpreter()")
+function _show_interp(io::IO, ::MIME"text/plain", ::MooncakeInterpreter{C,M}) where {C,M}
+    return print(io, "MooncakeInterpreter($M)")
 end
 
 MooncakeInterpreter(M::Type{<:Mode}) = MooncakeInterpreter(DefaultCtx, M)
@@ -121,6 +122,11 @@ end
 CC.nsplit_impl(info::NoInlineCallInfo) = CC.nsplit(info.info)
 CC.getsplit_impl(info::NoInlineCallInfo, idx::Int) = CC.getsplit(info.info, idx)
 CC.getresult_impl(info::NoInlineCallInfo, idx::Int) = CC.getresult(info.info, idx)
+@static if VERSION > v"1.12-"
+    CC.add_edges_impl(edges::Vector{Any}, info::NoInlineCallInfo) = CC.add_edges!(
+        edges, info.info
+    )
+end
 
 function Core.Compiler.abstract_call_gf_by_type(
     interp::MooncakeInterpreter{C,M},
@@ -131,9 +137,61 @@ function Core.Compiler.abstract_call_gf_by_type(
     sv::CC.AbsIntState,
     max_methods::Int,
 ) where {C,M}
+    argtypes = arginfo.argtypes
+    # Look up applicable methods for this call site without recursing into their bodies.
+    # We need the method set to check for primitives before deciding how to proceed.
+    if VERSION < v"1.12-"
+        𝕃ᵢ = Core.Compiler.typeinf_lattice(interp)
+        matches = Core.Compiler.find_matching_methods(
+            𝕃ᵢ,
+            argtypes,
+            atype,
+            Core.Compiler.method_table(interp),
+            Core.Compiler.InferenceParams(interp).max_union_splitting,
+            max_methods,
+        )
+    else
+        matches = Core.Compiler.find_method_matches(interp, argtypes, atype; max_methods)
+    end
+    if !isa(matches, Core.Compiler.FailedMethodMatch)
+        (; valid_worlds, applicable) = matches
+        # For applicable method matches in IR, we need to check if any of them is a primitive.
+        any_prim = any_matches_primitive(applicable, C, M, interp.world)
+        if any_prim
+            # A primitive already has a hand-written `rrule!!`, so Mooncake does not need
+            # to inspect its body when differentiating. The only thing we need here is the
+            # ordinary `CallMeta` for the call site, especially the inferred return type.
+            #
+            # We therefore ask `NativeInterpreter` for the `CallMeta`. This avoids recursing
+            # through the callee IR using Mooncake's primitive-search logic:
+            # `MooncakeInterpreter` would walk nested calls in that body, check them for
+            # primitives, and continue that search down the callee tree. That extra work is
+            # unnecessary for a primitive with a hand-written rule.
+            #
+            # `noinline_callmeta` below then blocks inlining/const-folding so the primitive
+            # call stays in the caller IR and Mooncake can dispatch its `rrule!!` at runtime.
+            # See PR #1115 for more discussion.
+            native_interp = CC.NativeInterpreter(interp.world)
+            ret = CC.abstract_call_gf_by_type(
+                native_interp, f, arginfo, si, atype, sv, max_methods
+            )
+            @static if VERSION < v"1.12-"
+                call = ret::CC.CallMeta
+                # Keep primitives in caller IR by blocking const-folding and inlining
+                _call = widen_rettype_callmeta(call, argtypes)
+                return noinline_callmeta(_call, atype)
+            else
+                return CC.Future{CC.CallMeta}(
+                    ret::CC.Future, interp, sv
+                ) do call, interp, sv
+                    _call = widen_rettype_callmeta(call, argtypes)
+                    return noinline_callmeta(_call, atype)
+                end
+            end
+        end
+    end
 
-    # invoke the default abstract call to get the default CC.CallMeta.
-    cm = @invoke CC.abstract_call_gf_by_type(
+    return @invoke CC.abstract_call_gf_by_type(
         interp::CC.AbstractInterpreter,
         f::Any,
         arginfo::CC.ArgInfo,
@@ -142,16 +200,71 @@ function Core.Compiler.abstract_call_gf_by_type(
         sv::CC.AbsIntState,
         max_methods::Int,
     )
+end
 
-    # Check to see whether the call in question is a Mooncake primitive. If it is, set its
-    # call info such that in the `CC.inlining_policy` it is not inlined away.
-    callinfo = is_primitive(C, M, atype) ? NoInlineCallInfo(cm.info, atype) : cm.info
+function any_matches_primitive(applicable, C, M, world)
+    for app in applicable
+        if VERSION < v"1.12-"
+            sig = app.spec_types
+        else
+            sig = app.match.spec_types
+        end
+        if is_primitive(C, M, sig, world)
+            return true
+        end
+    end
+    false
+end
 
-    # Construct a CallMeta correctly depending on the version of Julia.
+"""
+    widen_rettype_callmeta(call, argtypes)
+
+Decide whether to widen a primitive call’s inferred return type from `CC.Const`
+to its underlying Julia type (e.g. `Const(3.0)` → `Float64`).
+
+`CC.Const(val)` represents an exact value in Julia’s extended type lattice
+(see `Core.Const` and `Compiler/src/typelattice.jl`). If a call is inferred
+as `Const`, later compiler passes may fold it away:
+
+  - The inliner rewrites it to a `ConstantCase`.
+  - `compact!` propagates the literal and removes the dead statement.
+
+For Mooncake primitives, the call must remain in the final IR so that the
+corresponding `rrule!!` executes during AD. Applying `CC.widenconst`
+removes the `Const` wrapper and prevents folding.
+
+Widening is performed only when:
+  - the inferred return type is `Const`, and
+  - at least one runtime argument (i.e. excluding the callee) is not `Const`.
+
+If all runtime arguments are `Const`, the call is a genuine compile-time
+constant (e.g. `sin(1.0)` with a literal argument), and folding is safe.
+
+Arguments:
+  - `call`: `CC.CallMeta` for the call site
+  - `argtypes`: inferred argument types (1 = callee, 2:end = runtime args)
+"""
+function widen_rettype_callmeta(call::CC.CallMeta, argtypes::Vector{Any})
+    # Check whether any runtime argument is not `Const`
+    has_nonconst_runtime_arg = any(i -> !(argtypes[i] isa CC.Const), 2:length(argtypes))
+
+    should_widen = call.rt isa CC.Const && has_nonconst_runtime_arg
+
+    rt = should_widen ? CC.widenconst(call.rt) : call.rt
+
     @static if VERSION ≥ v"1.11-"
-        return CC.CallMeta(cm.rt, cm.exct, cm.effects, callinfo)
+        return CC.CallMeta(rt, call.exct, call.effects, call.info)
     else
-        return CC.CallMeta(cm.rt, cm.effects, callinfo)
+        return CC.CallMeta(rt, call.effects, call.info)
+    end
+end
+
+function noinline_callmeta(call::CC.CallMeta, @nospecialize(atype))
+    info = NoInlineCallInfo(call.info, atype)
+    @static if VERSION ≥ v"1.11-"
+        return CC.CallMeta(call.rt, call.exct, call.effects, info)
+    else
+        return CC.CallMeta(call.rt, call.effects, info)
     end
 end
 
@@ -179,7 +292,7 @@ end
         )
     end
 
-else # 1.11 and up.
+elseif VERSION < v"1.12-" # 1.11
     function CC.inlining_policy(
         interp::MooncakeInterpreter,
         @nospecialize(src),
@@ -191,6 +304,22 @@ else # 1.11 and up.
 
         # If not a primitive, AD doesn't care about it. Use the usual inlining strategy.
         return @invoke CC.inlining_policy(
+            interp::CC.AbstractInterpreter, src::Any, info::CC.CallInfo, stmt_flag::UInt32
+        )
+    end
+
+else # 1.12 and up.
+    function CC.src_inlining_policy(
+        interp::MooncakeInterpreter,
+        @nospecialize(src),
+        @nospecialize(info::CC.CallInfo),
+        stmt_flag::UInt32,
+    )
+        # Do not inline away primitives.
+        info isa NoInlineCallInfo && return false
+
+        # If not a primitive, AD doesn't care about it. Use the usual inlining strategy.
+        return @invoke CC.src_inlining_policy(
             interp::CC.AbstractInterpreter, src::Any, info::CC.CallInfo, stmt_flag::UInt32
         )
     end
@@ -219,4 +348,42 @@ function get_interpreter(mode::Type{<:Mode})
         GLOBAL_INTERPRETERS[mode] = MooncakeInterpreter(DefaultCtx, mode)
     end
     return GLOBAL_INTERPRETERS[mode]
+end
+
+"""
+    get_interpreter(mode::Type{<:Mode}, world::UInt)
+
+Returns a `MooncakeInterpreter` for `mode` pinned to `world`. When `world` is the current
+world age this is equivalent to `get_interpreter(mode)` (served from the process-wide cache).
+A non-current `world` (e.g. when a Lazy/Dynamic rule rebuilds at its stored prediction world)
+yields a fresh, uncached interpreter, leaving the shared current-world cache untouched.
+"""
+function get_interpreter(mode::Type{<:Mode}, world::UInt)
+    world == Base.get_world_counter() && return get_interpreter(mode)
+    return MooncakeInterpreter(DefaultCtx, mode; world)
+end
+
+"""
+    empty_mooncake_caches!()
+
+This is an internal function and not part of the public API. Called by `prepare_pullback_cache`,
+`prepare_gradient_cache`, and `prepare_derivative_cache` when `Config(empty_cache=true)`
+is passed.
+
+Empties all three per-interpreter caches for both `ForwardMode` and `ReverseMode`:
+- `oc_cache` : compiled `DerivedRule` / `OpaqueClosures`
+- `code_cache` : `CodeInstance` objects (Julia IR per `MethodInstance`)
+- `inf_cache` : `InferenceResult` objects from type inference
+
+After clearing, Mooncake re-derives rules from scratch on the next use. Only Julia-level
+(GC-managed) objects are freed; JIT-compiled native machine code allocated by LLVM
+is held permanently by the Julia runtime.
+"""
+function empty_mooncake_caches!()
+    for interp in values(GLOBAL_INTERPRETERS)
+        empty!(interp.oc_cache)
+        empty!(interp.code_cache)
+        empty!(interp.inf_cache)
+    end
+    return nothing
 end

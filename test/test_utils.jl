@@ -13,6 +13,8 @@
         @test has_equal_data(ones(5), ones(5))
         @test has_equal_data(Base, Base)
         @test !has_equal_data(Base, Core)
+        @test has_equal_data(:a, :a)
+        @test !has_equal_data(:a, :b)
         @test has_equal_data(GlobalRef(Base, :sin), GlobalRef(Base, :sin))
         @test !has_equal_data(GlobalRef(Base, :sin), GlobalRef(Base, :cos))
         @test !has_equal_data(GlobalRef(Base, :sin), GlobalRef(Core, :sin))
@@ -60,6 +62,13 @@
             (a=make_indirect_circular_reference_array(); a[1][1]=1.0; a),
             (b=make_indirect_circular_reference_array(); b[1][1]=2.0; b),
         )
+
+        m = only(methods(sin, (Float64,)))
+        @test has_equal_data(m, m)
+        # `m.specializations` is a bare `MethodInstance` or an svec with `#undef` slots;
+        # `Base.specializations` normalises both.
+        mi = first(Base.specializations(m))
+        @test has_equal_data(mi, mi)
     end
     @testset "populate_address_map" begin
         @testset "primitive types" begin
@@ -130,5 +139,34 @@
         z = (x..., primal(y_ȳ))
         z̄ = (x̄..., tangent(y_ȳ))
         @test_throws AssertionError populate_address_map(z, z̄)
+    end
+    @testset "count_allocs" begin
+        # Function form: zero-alloc functions return 0.
+        @test TestUtils.count_allocs(identity, 1.0) == 0
+        @test TestUtils.count_allocs(+, 1.0, 2.0) == 0
+        @test TestUtils.count_allocs(Base.sin, 1.0) == 0
+        # Regression: non-isbits arg (heap object). An @noinline barrier would box the
+        # array when passing it through the Vararg tuple, causing a spurious allocation
+        # on Julia 1.10. The @generated design avoids the barrier entirely.
+        @test TestUtils.count_allocs(length, [1, 2, 3]) == 0
+        # Regression: Type{T} arg. A plain Vararg method widens Type{Float64} to DataType,
+        # causing a spurious boxing allocation on Julia 1.12. The @generated design
+        # specialises on element types and preserves the concrete Type{T} parameter.
+        @test TestUtils.count_allocs(isbitstype, Float64) == 0
+        @test TestUtils.count_allocs(Mooncake.fdata_type, Tuple{Float64}) == 0
+        @test TestUtils.count_allocs(Mooncake.fdata_type, Tuple{Vector{Float64}}) == 0
+    end
+    @testset "max_fd_step kwarg for testing rules" begin
+        # log is a primitive in Mooncake, so we wrap it in a lambda to test the derived-rule
+        # path. The input 0.005 is close to the boundary of log's domain (x > 0), so we cap
+        # the FD step at 1e-3 to avoid perturbing into x ≤ 0.
+        TestUtils.test_rule(
+            StableRNG(123),
+            x -> log(x),
+            0.005;
+            is_primitive=false,
+            print_results=false,
+            max_fd_step=1e-3,
+        )
     end
 end

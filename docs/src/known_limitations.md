@@ -9,6 +9,54 @@ While `Mooncake.jl` should now work on a very large subset of the language, ther
 1. Builtins which require rules. The vast majority of them have rules now, but some don't. You should get a sensible error if you encounter a primitive without a rule.
 1. Anything involving tasks / threading -- we have no thread safety guarantees and, at the time of writing, I'm not entirely sure what error you will find if you attempt to AD through code which uses Julia's task / thread system. The same applies to distributed computing. These limitations ought to be possible to resolve.
 
+## Numerical Workarounds and Singularities
+
+Numerical workarounds can preserve function values while producing incorrect derivatives under automatic differentiation.
+For example, `LogExpFunctions.xlogy` implements:
+
+```julia
+function xlogy(x::Number, y::Number)
+    result = x * log(y)
+    return iszero(x) && !isnan(y) ? zero(result) : result
+end
+```
+
+At `(0, 2)`, differentiating the selected branch gives zero, but the partial derivative with respect to `x` is `log(2)`.
+Special functions with parameter-specific formulas or termination conditions can present similar problems.
+These limitations are not specific to Mooncake.
+Custom differentiation rules may be needed; see [Defining Rules](@ref).
+
+## `try`/`catch`/`finally` Blocks
+
+Mooncake.jl does not support differentiating through `try`/`catch` or `try`/`finally` blocks
+in **reverse mode**. Attempting to do so will produce an `UnhandledLanguageFeatureException`
+with a message explaining the cause. Forward mode does support these constructs.
+
+**The fix** is to replace `try`/`catch` blocks with explicit conditional checks where possible.
+For example:
+
+```julia
+# Does not work with Mooncake
+function safe_log(x)
+    try
+        return log(x)
+    catch e
+        return -Inf
+    end
+end
+
+# Works with Mooncake
+function safe_log(x)
+    x <= 0 && return -Inf
+    return log(x)
+end
+```
+
+If the `try`/`catch` block cannot be avoided (e.g. it lives inside a third-party library), the
+alternative is to provide a custom `rrule!!` for the function that contains the `try`/`catch`
+block, so that Mooncake never needs to differentiate through the block itself.
+See [Defining Rules](@ref) for guidance on writing custom rules.
+
 ## Mutation of Global Variables
 
 ```@meta
@@ -41,14 +89,189 @@ julia> Mooncake.value_and_gradient!!(rule, foo, 2.0)
 ```
 Observe that while it has correctly computed the identity function, the gradient is zero.
 
-The takehome: do not attempt to differentiate functions which modify global state. Uses of globals which does not involve mutating them is fine though.
+The takeaway: do not attempt to differentiate functions which modify global state. Reading globals is fine; mutating globals is not.
 
-## Circular References
+## Mutable aliases involving `NoTangent` parents or globals
 
-To a large extent, Mooncake.jl does not presently support circular references in an automatic fashion.
-It is generally possible to hand-write solutions, so we explain some of the problems here, and the general approach to resolving them.
+Mooncake may silently return incorrect derivatives when the same mutable storage is differentiated directly and also reachable through a `NoTangent` parent or global. Reverse and `frule!!`-based forward modes are affected. See [issue #1295](https://github.com/chalk-lab/Mooncake.jl/issues/1295).
 
-### Tangent Types
+A `NoTangent` parent:
+
+```jldoctest opaque-alias
+julia> struct Box
+           x::Vector{Float64}
+       end
+
+julia> Mooncake.tangent_type(::Type{Box}) = NoTangent;
+
+julia> function f(state)
+           box, x = state
+           box.x[1] *= 2
+           return x[1]
+       end;
+
+julia> x = [3.0]; state = (Box(x), x);
+
+julia> rule = Mooncake.build_rrule(f, state);
+
+julia> Mooncake.value_and_gradient!!(rule, f, state)
+(6.0, (NoTangent(), (NoTangent(), [1.0])))
+```
+
+`state` exposes one vector as `x` and `box.x`. Mooncake differentiates `x`, but reading through the `NoTangent` `Box` creates separate derivative storage. Mutation through `box.x` updates only that storage, so Mooncake returns `[1.0]`. This program should be rejected.
+
+A global:
+
+```jldoctest global-alias
+julia> const X = [3.0];
+
+julia> function g(x)
+           X[1] *= 2
+           return x[1]
+       end;
+
+julia> rule = Mooncake.build_rrule(g, X);
+
+julia> Mooncake.value_and_gradient!!(rule, g, X)
+(6.0, (NoTangent(), [1.0]))
+```
+
+`X` and `x` are the same vector. Mooncake treats `X` as constant and initializes its derivative storage separately from `x`'s. Mutation through `X` updates only the global storage, so Mooncake returns `[1.0]`. This program should be rejected.
+
+## Passing Differentiable Data as a Type
+
+Credit goes to Guillaume Dalle for noticing this limitation.
+
+This is an example of a known silent correctness issue.
+```jldoctest
+julia> struct T{x} end
+
+julia> @noinline getparam(::T{x}) where {x} = x
+getparam (generic function with 1 method)
+
+julia> mysquare(x) = getparam(T{x}())^2
+mysquare (generic function with 1 method)
+
+julia> cache = Mooncake.prepare_derivative_cache(mysquare, 3.0);
+
+julia> Mooncake.value_and_derivative!!(cache, Mooncake.zero_dual(mysquare), Mooncake.Dual(3.0, 1.0))
+Mooncake.Dual{Float64, Float64}(9.0, 0.0)
+```
+As you can see, the tangent is `0.0` rather than `6.0`.
+
+However, we view this as a pathological use of Julia's language features, and believe it is unlikely to cause trouble in practice.
+If you encounter a practical situation in which it is very important that this example work correctly, please open an issue.
+
+## Primitives and Overlays
+
+[`@mooncake_overlay`](@ref Mooncake.@mooncake_overlay) and [`@is_primitive`](@ref Mooncake.@is_primitive) both let you change what Mooncake sees when it differentiates a function, but they hook in at different layers and do not compose.
+`@mooncake_overlay` swaps in a replacement body Mooncake walks through; `@is_primitive` stops Mooncake walking and dispatches to a hand-written rule instead.
+Marking a signature as a primitive shadows any overlay reachable through it — the rule fires, the overlay does not, and Mooncake infers return types from the original method, not from the overlay.
+
+This causes two failure modes:
+
+1. **An overlay that changes the return type breaks the rule's return-type contract.**
+   Mooncake infers the return type from the original method, so a manual rule that returns a value of the overlaid type produces a `CoDual` that disagrees with that inferred type, triggering a runtime `TypeError`.
+   When the original and overlaid methods return the same type, the runtime check is trivially satisfied and the bug surfaces only as an incorrect gradient.
+
+2. **An overlay inside a primitive's body never runs.**
+   The rule replaces the body and runs the primal through ordinary Julia dispatch, which ignores overlays.
+   An overlay introduced to work around unsupported code reached from inside the primitive is silently inert — move it to a signature Mooncake still differentiates, or fold the workaround into the rule.
+
+The example below covers both cases.
+Case (1) overlays the primitive itself; case (2) overlays a helper called from the primitive's body.
+Each identity check asks whether Mooncake's inferred return type for the caller is `A` (the original) rather than `B` (what the overlay would produce):
+
+```jldoctest overlay-primitive-doctest
+julia> struct A end
+
+julia> struct B end
+
+julia> direct_primitive(::A) = A()
+direct_primitive (generic function with 1 method)
+
+julia> Mooncake.@mooncake_overlay direct_primitive(::A) = B();
+
+julia> Mooncake.@is_primitive Mooncake.DefaultCtx Mooncake.ReverseMode Tuple{typeof(direct_primitive), A}
+
+julia> helper(::A) = A()
+helper (generic function with 1 method)
+
+julia> Mooncake.@mooncake_overlay helper(::A) = B();
+
+julia> indirect_primitive(x::A) = helper(x)
+indirect_primitive (generic function with 1 method)
+
+julia> Mooncake.@is_primitive Mooncake.DefaultCtx Mooncake.ReverseMode Tuple{typeof(indirect_primitive), A}
+
+julia> caller_direct(x::A) = direct_primitive(x)
+caller_direct (generic function with 1 method)
+
+julia> caller_indirect(x::A) = indirect_primitive(x)
+caller_indirect (generic function with 1 method)
+
+julia> interp = Mooncake.MooncakeInterpreter(Mooncake.DefaultCtx, Mooncake.ReverseMode);
+
+julia> Base.code_ircode_by_type(Tuple{typeof(caller_direct), A}; interp)[1][2] === A
+true
+
+julia> Base.code_ircode_by_type(Tuple{typeof(caller_indirect), A}; interp)[1][2] === A
+true
+```
+
+Mooncake infers `A` for both callers, even though the overlays would produce a `B` — so any rule written against the overlay's return type fails the runtime check.
+Apply only one of `@mooncake_overlay` or `@is_primitive` to a given signature, and make sure no overlay you rely on sits behind a primitive's rule.
+
+## Explicit `invoke` of a primitive
+
+An explicit `invoke` encountered during differentiation bypasses Mooncake's protection against inlining primitives.
+Inlining can silently discard the custom rule; surviving calls can use the rule for ordinary dispatch, changing the value and derivative ([#1300](https://github.com/chalk-lab/Mooncake.jl/issues/1300)).
+
+```julia
+f(x::Real) = sin(x)
+f(x::Float64) = cos(x)
+g(x::Float64) = invoke(f, Tuple{Real}, x)
+```
+
+With a rule for `f(::Float64)`, `g` may incorrectly use that rule although its primal computes `sin(x)`.
+
+This can occur when differentiated code explicitly invokes a generic fallback despite a rule for the specialised call.
+It can also arise indirectly: [`Base.Math.@horner`](https://github.com/JuliaLang/julia/blob/v1.12.7/base/math.jl#L176-L179) expands to `invoke(evalpoly, Tuple{Any, Tuple}, ...)`.
+That becomes problematic if a matching `evalpoly` rule is added; the macro alone does not trigger the limitation.
+Without a matching rule, Mooncake differentiates the invoked method normally.
+
+Simply replacing `invoke` with ordinary dispatch can change the primal's behaviour.
+Wrap the `invoke` in a function with its own rule.
+Calls inside an existing primitive's body are unaffected.
+
+## Differentiating CUDA Kernels
+
+Mooncake.jl supports differentiation of CUDA kernels in general, provided a suitable rule exists. However, it does not support kernels that surface as foreign calls, such as those generated via KernelAbstractions.jl (see [issue #648](https://github.com/chalk-lab/Mooncake.jl/issues/648) and [issue #835](https://github.com/chalk-lab/Mooncake.jl/issues/835)). Support for these foreign-call kernels is outside the scope of the project and is considered a non-goal.
+
+Users who need to differentiate through these code paths may do so by providing a custom rule, potentially generated with the assistance of another automatic differentiation tool (cf. [this comment](https://github.com/chalk-lab/Mooncake.jl/issues/648#issuecomment-3058010288)).
+
+Second-order AD (HVP / Hessian, via forward-over-reverse) is more restricted on CUDA: it works for array-level operations whose rules do not launch a custom per-element kernel (e.g. `sum(x)`, `dot`, matrix multiplication), but operations that map a Julia function over array elements inside a GPU kernel (broadcasting, `sum(f, x)`-style reductions) cannot yet be differentiated at second order. These raise a clear `ArgumentError` rather than silently returning wrong derivatives. Gradients and JVPs are unaffected.
+
+## Differentiating SIMD Code
+
+When the primal code admits SIMD (Single Instruction, Multiple Data) optimisations by the LLVM compiler, reverse-mode automatic differentiation in Mooncake can inhibit LLVM's ability to apply the same optimisations. This occurs because the transformations introduced during differentiation may obscure the structural patterns that LLVM relies on for vectorisation.
+
+Consequently, code that performs well in its primal form may suffer substantial slowdowns after differentiation. In performance-critical regions, this can often be mitigated by providing hand-written derivative rules (`rrule!!`s, see [Defining Rules](@ref)). Such rules allow explicit control over the structure of the adjoint computation and can be used to preserve SIMD-friendly loop forms.
+
+If you observe unexpected performance regressions in differentiated code that is known to vectorise effectively in its primal form, consider implementing custom rules for the relevant operations. For example, a customised performance-oriented rule is added for `kron` in Mooncake ([PR #886](https://github.com/chalk-lab/Mooncake.jl/pull/886)) to address the loss of SIMD vectorisation that arises when differentiating the SIMD-friendly primal implementation of `kron` in Julia's standard library ([LinearAlgebra implementation](https://github.com/JuliaLang/LinearAlgebra.jl/blob/b1f48a442ba5f41479d4fb6f3e931b1ac2f21059/src/dense.jl#L499-L531)).
+
+## Differentiating Through Another Automatic Differentiation Library
+
+Mooncake.jl is not meant to differentiate *through* another automatic differentiation library.
+If the function you hand to Mooncake itself calls a second autograd tool — for example, by building and replaying a tape — you are asking Mooncake to differentiate that tool's internals rather than your underlying mathematical function.
+This is outside Mooncake's scope and is not officially supported. See [issue #1209](https://github.com/chalk-lab/Mooncake.jl/issues/1209) for an example.
+
+If part of your computation genuinely needs another AD tool, wrap that part in a custom rule, so Mooncake treats it as a primitive and never looks inside; see [Defining Rules](@ref).
+
+## Circular References in Type Declarations
+
+Mooncake.jl's default `tangent_type` implementation cannot support types which refer to themselves either directly or indirectly in their definition.
+Below is an example in which a type refers to itself directly in its definition.
 
 _**The Problem**_
 
@@ -88,35 +311,6 @@ end
 The point here is that you can manually resolve the circular dependency using a data structure which mimics the primal type.
 You will, however, need to implement similar methods for `zero_tangent`, `randn_tangent`, etc, and presumably need to implement additional `getfield` and `setfield` rules which are specific to this type.
 An example implementation of this is provided [here](developer_documentation/custom_tangent_type.md).
-
-### Circular References in General
-
-_**The Problem**_
-
-Consider a type of the form
-```julia
-mutable struct Foo
-    x
-    Foo() = new()
-end
-```
-In this instance, `tangent_type` will work fine because `Foo` does not directly reference itself in its definition.
-Moreover, general uses of `Foo` will be fine.
-
-However, it's possible to construct an instance of `Foo` with a circular reference:
-```julia
-f = Foo()
-f.x = f
-```
-This is actually fine provided we never attempt to call `zero_tangent` / `randn_tangent` / similar functionality on `f` once we've set its `x` field to itself.
-If we attempt to call such a function, we'll find ourselves with a stack overflow.
-
-_**The Solution**_
-This is a little tricker to handle.
-You could specialise `zero_tangent` etc for `Foo`, but this is something of a pain.
-Fortunately, it seems to be incredibly rare that this is ever a problem in practice.
-If we gain evidence that this _is_ often a problem in practice, we'll look into supporting `zero_tangent` etc automatically for this case.
-
 
 ## Tangent Generation and Pointers
 
@@ -162,4 +356,3 @@ Honestly, your best bet is just to avoid differentiating functions whose argumen
 ```@meta
 DocTestSetup = nothing
 ```
-

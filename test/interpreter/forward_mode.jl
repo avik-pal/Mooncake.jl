@@ -11,7 +11,71 @@ function foo(x)
     return y
 end
 
+# Helpers for the world-advance staleness test below (issue #1218).
+# `stale_fwd_lazy` uses LazyFRule; `stale_fwd_dyn` uses DynamicFRule.
+stale_fwd_inner(x) = Float32(x) * 2.0f0
+@noinline stale_fwd_callee(x) = stale_fwd_inner(x)
+# Two `:invoke` levels: one for the pinned rebuild, one for the rules that rebuild itself
+# constructs, which predicted at the current world until they were given the pinned one.
+@noinline stale_fwd_mid(x) = stale_fwd_callee(x)
+stale_fwd_lazy(x) = stale_fwd_mid(x)
+const STALE_FWD_FNS = Function[stale_fwd_mid]
+stale_fwd_dyn(x) = (STALE_FWD_FNS[1])(x)
+
+@noinline refined_fwd_inner(x) =
+    sizeof(x) == sizeof(typeof(x)) ? x : Base.inferencebarrier(x)
+@noinline refined_fwd_outer(x) = refined_fwd_inner(x)
+refined_fwd(x) = refined_fwd_outer(x)
+
+const GC_PRESERVE_OWNERS = Ref((WeakRef(nothing), WeakRef(nothing)))
+gc_preserve_storage(x) = @static VERSION >= v"1.11-" ? x.ref.mem : x
+function gc_preserve_observe(x)
+    GC_PRESERVE_OWNERS[] = (
+        WeakRef(gc_preserve_storage(x)), WeakRef(gc_preserve_storage(x))
+    )
+    return x
+end
+Mooncake.@is_primitive DefaultCtx ForwardMode Tuple{
+    typeof(gc_preserve_observe),Vector{Float64}
+}
+function Mooncake.frule!!(::Dual{typeof(gc_preserve_observe)}, x::Dual)
+    GC_PRESERVE_OWNERS[] = (
+        WeakRef(gc_preserve_storage(primal(x))), WeakRef(gc_preserve_storage(tangent(x)))
+    )
+    return x
+end
+@noinline function gc_preserve_alive(::Ptr{Float64})
+    GC.gc(true)
+    return map(w -> w.value !== nothing, GC_PRESERVE_OWNERS[])
+end
+Mooncake.@zero_derivative DefaultCtx Tuple{typeof(gc_preserve_alive),Ptr{Float64}}
+function gc_preserve_probe(x)
+    a = gc_preserve_observe(copy(x))
+    return GC.@preserve a gc_preserve_alive(pointer(a))
+end
+
 @testset "s2s_forward_mode_ad" begin
+    @testset "rule return type after normalisation (#1327)" begin
+        for x in (1.0f0, 1.0), debug_mode in (false, true)
+            rule = build_frule(refined_fwd, x; debug_mode)
+            result = rule(zero_dual(refined_fwd), Dual(x, one(x)))
+            @test primal(result) === x
+            @test tangent(result) === one(x)
+        end
+    end
+
+    @testset "GC preservation of primal and tangent storage (issue #1303)" begin
+        # Observe collection without dereferencing a potentially stale pointer.
+        @test gc_preserve_probe([1.0, 2.0]) == (true, true)
+        rule = build_frule(gc_preserve_probe, [1.0, 2.0])
+        for _ in 1:2
+            result = rule(zero_dual(gc_preserve_probe), Dual([1.0, 2.0], [3.0, 4.0]))
+            @test primal(result) == (true, true)
+            GC.gc(true)
+            @test all(w -> w.value === nothing, GC_PRESERVE_OWNERS[])
+        end
+    end
+
     test_cases = collect(enumerate(TestResources.generate_test_functions()))
     @testset "$n - $(_typeof((fx)))" for (n, (int_only, pf, _, fx...)) in test_cases
         @info "$n: $(_typeof(fx))"
@@ -22,11 +86,49 @@ end
         )
     end
 
+    @testset "integration testing for invalid global ref errors" begin
+        @static if VERSION > v"1.12-"
+            @test_throws(
+                Mooncake.UnhandledLanguageFeatureException,
+                Mooncake.build_frule(Mooncake.TestResources.non_const_global_ref, 5.0)
+            )
+        end
+    end
+
     # Try try-catch statements.
-    rng = StableRNG(123)
-    perf_flag = :none
-    interface_only = false
-    is_primitive = false
-    mode = ForwardMode
-    TestUtils.test_rule(rng, foo, 5.0; perf_flag, interface_only, is_primitive, mode)
+    @testset "try-catch" begin
+        rng = StableRNG(123)
+        perf_flag = :none
+        interface_only = false
+        is_primitive = false
+        mode = ForwardMode
+        TestUtils.test_rule(rng, foo, 5.0; perf_flag, interface_only, is_primitive, mode)
+    end
+
+    @testset "capture in ReturnNode regression test" begin
+        struct RegTestStruct
+            x::Vector{Float64}
+            RegTestStruct() = new()
+        end
+        f(x) = RegTestStruct()
+        TestUtils.test_rule(
+            StableRNG(123), f, 1.0; perf_flag=:none, is_primitive=false, mode=ForwardMode
+        )
+    end
+
+    # Without the fix the lazy path throws a `convert` MethodError in _build_rule!; both
+    # paths must return the build-world result (Float32), not the post-advance (Float64).
+    @testset "stale rule build-world after world advance (issue #1218)" begin
+        lazy = Mooncake.build_frule(stale_fwd_lazy, 1.5)
+        dyn = Mooncake.build_frule(stale_fwd_dyn, 1.5)
+        @eval stale_fwd_inner(x::Float64) = x * 2.0  # advance world; tightens callee's type
+        lazy_out = Base.invokelatest(
+            lazy, Mooncake.zero_dual(stale_fwd_lazy), Mooncake.Dual(1.5, 1.0)
+        )
+        dyn_out = Base.invokelatest(
+            dyn, Mooncake.zero_dual(stale_fwd_dyn), Mooncake.Dual(1.5, 1.0)
+        )
+        @test Mooncake.primal(lazy_out) === 3.0f0
+        @test Mooncake.primal(dyn_out) === 3.0f0
+    end
 end;

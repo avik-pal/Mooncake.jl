@@ -1,5 +1,5 @@
 """
-    normalise!(ir::IRCode, spnames::Vector{Symbol})
+    normalise!(ir::IRCode, spnames::Vector{Symbol}; preserve_gc=false)
 
 Apply a sequence of standardising transformations to `ir` which leaves its semantics
 unchanged, but makes AD more straightforward. In particular, replace
@@ -11,6 +11,9 @@ unchanged, but makes AD more straightforward. In particular, replace
 6. `memoryrefget` calls to `lmemoryrefget` calls, and related transformations,
 7. `gc_preserve_begin` / `gc_preserve_end` exprs so that memory release is delayed.
 
+With `preserve_gc=true`, leave native GC preservation scopes intact for forward AD,
+which maps the preserved owners to `Dual`s to retain both primal and tangent storage.
+
 `spnames` are the names associated to the static parameters of `ir`. These are needed when
 handling `:foreigncall` expressions, in which it is not necessarily the case that all
 static parameter names have been translated into either types, or `:static_parameter`
@@ -20,7 +23,7 @@ Unfortunately, the static parameter names are not retained in `IRCode`, and the 
 from which the `IRCode` is derived must be consulted. `Mooncake.is_vararg_and_sparam_names`
 provides a convenient way to do this.
 """
-function normalise!(ir::IRCode, spnames::Vector{Symbol})
+function normalise!(ir::IRCode, spnames::Vector{Symbol}; preserve_gc=false)
     sp_map = Dict{Symbol,CC.VarState}(zip(spnames, ir.sptypes))
     ir = interpolate_boundschecks!(ir)
     ir = fix_up_invoke_inference!(ir)
@@ -31,7 +34,7 @@ function normalise!(ir::IRCode, spnames::Vector{Symbol})
         inst = intrinsic_to_function(inst)
         inst = lift_getfield_and_others(inst)
         inst = lift_memoryrefget_and_memoryrefset_builtins(inst)
-        inst = lift_gc_preservation(inst)
+        preserve_gc || (inst = lift_gc_preservation(inst))
         stmt(ir.stmts)[n] = inst
     end
     ir = const_prop_gotoifnots!(ir)
@@ -119,13 +122,17 @@ function fix_up_invoke_inference!(ir::IRCode)::IRCode
     stmts = ir.stmts
     for n in 1:length(stmts)
         if Meta.isexpr(stmt(stmts)[n], :invoke) && CC.widenconst(stmts.type[n]) == Any
-            mi = stmt(stmts)[n].args[1]::Core.MethodInstance
+            mi = get_mi(stmt(stmts)[n].args[1])
             R = isdefined(mi, :cache) ? mi.cache.rettype : CC.return_type(mi.specTypes)
             stmts.type[n] = R
         end
     end
     return ir
 end
+function get_mi(ci::Core.CodeInstance)
+    @static isdefined(CC, :get_ci_mi) ? CC.get_ci_mi(ci) : ci.def
+end
+get_mi(mi::Core.MethodInstance) = mi
 
 """
     foreigncall_to_call(inst, sp_map::Dict{Symbol, CC.VarState})
@@ -159,18 +166,18 @@ end
 
 # Copied from Umlaut.jl.
 __extract_foreigncall_name(x::Symbol) = Val(x)
+__extract_foreigncall_name(x::String) = Val(Symbol(x))
 function __extract_foreigncall_name(x::Expr)
-    # Make sure that we're getting the expression that we're expecting.
-    !Meta.isexpr(x, :call) && error("unexpected expr $x")
-    !isa(x.args[1], GlobalRef) && error("unexpected expr $x")
-    x.args[1].name != :tuple && error("unexpected expr $x")
-    length(x.args) != 3 && error("unexpected expr $x")
-
-    # Parse it into a name that can be passed as a type.
-    v = eval(x)
-    return Val((Symbol(v[1]), Symbol(v[2])))
+    # JuliaLang/julia#59165 changes Core.tuple calls to Expr(:tuple, name[, lib])
+    # in Julia 1.13. Both representations evaluate to a tuple.
+    is_call_to_tuple = Meta.isexpr(x, :call) && __get_arg(x.args[1]) === tuple
+    Meta.isexpr(x, :tuple) || is_call_to_tuple || error("unexpected expr $x")
+    return __extract_foreigncall_name(eval(x))
 end
-__extract_foreigncall_name(v::Tuple) = Val((Symbol(v[1]), Symbol(v[2])))
+__extract_foreigncall_name(v::Tuple{Any}) = __extract_foreigncall_name(v[1])
+function __extract_foreigncall_name(v::Tuple)
+    Val((Symbol(v[1]), Symbol(v[2])))
+end
 __extract_foreigncall_name(x::QuoteNode) = __extract_foreigncall_name(x.value)
 function __extract_foreigncall_name(x::GlobalRef)
     return __extract_foreigncall_name(getglobal(x.mod, x.name))
@@ -431,6 +438,27 @@ function const_prop_gotoifnots!(ir::IRCode)
     return ir
 end
 
+# On Julia 1.10, passing findfirst's Union{Int,Nothing} return directly to deleteat!
+# introduces a union-split that propagates through generate_dual_ir and causes spurious
+# allocation regressions. The !== nothing guard narrows to Int before the call.
+# Note: the 1.10 path silently does nothing when the item is absent; the 1.11 path throws
+# BoundsError. This is fine because remove_edge! is only ever called with edges that exist.
+#
+# MWE (Julia 1.10):
+#   f(v) = deleteat!(v, findfirst(==(2), v))
+#   g(v) = (i = findfirst(==(2), v); i !== nothing && deleteat!(v, i))
+#   @code_warntype f([1,2,3])  # deleteat! receives Union{Int,Nothing} → union-split
+#   @code_warntype g([1,2,3])  # deleteat! receives Int → monomorphic
+@static if VERSION < v"1.11-"
+    function _deleteat!(v, item)
+        i = findfirst(==(item), v)
+        i !== nothing && deleteat!(v, i)
+        return v
+    end
+else
+    _deleteat!(v, item) = deleteat!(v, findfirst(==(item), v))
+end
+
 """
     remove_edge!(ir::IRCode, from::Int, to::Int)
 
@@ -444,12 +472,12 @@ function remove_edge!(ir::IRCode, from::Int, to::Int)
 
     # Remove the `to` block from the `from` block's successor list.
     succs = ir.cfg.blocks[from].succs
-    deleteat!(succs, findfirst(n -> n == to, succs))
+    _deleteat!(succs, to)
 
     # Remove the `from` block from the `to` block's predecessor list.
     to_blk = ir.cfg.blocks[to]
     preds = to_blk.preds
-    deleteat!(preds, findfirst(n -> n == from, preds))
+    _deleteat!(preds, from)
 
     # Remove the `from` edge from any `PhiNode`s at the start of next blk.
     stmts = stmt(ir.stmts)

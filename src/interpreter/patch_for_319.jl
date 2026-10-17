@@ -4,9 +4,8 @@
 # any time at all reading / understanding this file unless you are actively working on this
 # issue, and find it useful.
 #
-# As soon as patch versions of Julia (both LTS and Release) are made which contain a fix for
-# the bug underlying the above issue, this code can and should be removed, and the minimum
-# versions of Julia which Mooncake supports bumped.
+# JuliaLang/julia#56201 fixes this in Julia 1.13. Remove this file once all supported
+# Julia versions contain that fix.
 #
 # The only place in which this code seeps into Mooncake.jl code is in Mooncake.optimise_ir!,
 # located in src/interpreter/ir_utils.jl . In particular, we replace the `local_interp`
@@ -81,7 +80,7 @@ end
     end
 
     # Calls populate_def_use_map! -- see above.
-    function CC._ir_abstract_constant_propagation(
+    function ir_abstract_constant_propagation(
         interp::BugPatchInterpreter,
         irsv::CC.IRInterpretationState;
         externally_refined::Union{Nothing,BitSet}=nothing,
@@ -129,7 +128,13 @@ end
                     CC.delete!(ssa_refined, idx)
                 end
                 check_ret!(stmt, idx)
-                is_terminator_or_phi = (isa(stmt, PhiNode) || CC.isterminator(stmt))
+                @static if VERSION > v"1.12-"
+                    is_terminator_or_phi = (
+                        isa(stmt, PhiNode) || stmt === nothing || CC.isterminator(stmt)
+                    )
+                else
+                    is_terminator_or_phi = (isa(stmt, PhiNode) || CC.isterminator(stmt))
+                end
                 if typ === CC.Bottom && !(idx == lstmt && is_terminator_or_phi)
                     return true
                 end
@@ -232,14 +237,32 @@ end
             (nothrow | noub) || break
         end
 
-        if CC.last(irsv.valid_worlds) >= CC.get_world_counter()
-            # if we aren't cached, we don't need this edge
-            # but our caller might, so let's just make it anyways
-            CC.store_backedges(CC.frame_instance(irsv), irsv.edges)
+        @static if VERSION ≥ v"1.12-"
+            if irsv.frameid != 0
+                callstack = irsv.callstack::Vector{CC.AbsIntState}
+                @assert callstack[end] === irsv && length(callstack) == irsv.frameid
+                pop!(callstack)
+            end
+        else
+            if CC.last(irsv.valid_worlds) >= CC.get_world_counter()
+                # if we aren't cached, we don't need this edge
+                # but our caller might, so let's just make it anyways
+                CC.store_backedges(CC.frame_instance(irsv), irsv.edges)
+            end
         end
 
         return Pair{Any,Tuple{Bool,Bool}}(
             CC.maybe_singleton_const(ultimate_rt), (nothrow, noub)
+        )
+    end
+
+    @static if VERSION ≥ v"1.12-"
+        CC.ir_abstract_constant_propagation(interp::BugPatchInterpreter, irsv::CC.IRInterpretationState; externally_refined::Union{Nothing,BitSet}=nothing) = ir_abstract_constant_propagation(
+            interp, irsv; externally_refined
+        )
+    else
+        CC._ir_abstract_constant_propagation(interp::BugPatchInterpreter, irsv::CC.IRInterpretationState; externally_refined::Union{Nothing,BitSet}=nothing) = ir_abstract_constant_propagation(
+            interp, irsv; externally_refined
         )
     end
 

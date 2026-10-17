@@ -1,20 +1,25 @@
 a_primitive(x) = sin(x)
 non_primitive(x) = sin(x)
 
-function Mooncake.is_primitive(
-    ::Type{DefaultCtx}, ::Type{ReverseMode}, ::Type{<:Tuple{typeof(a_primitive),Any}}
-)
-    return true
-end
-function Mooncake.is_primitive(
-    ::Type{DefaultCtx}, ::Type{ReverseMode}, ::Type{<:Tuple{typeof(non_primitive),Any}}
-)
-    return false
-end
+Mooncake.@is_primitive DefaultCtx ReverseMode Tuple{typeof(a_primitive),Float64}
 
 contains_primitive(x) = @inline a_primitive(x)
 contains_non_primitive(x) = @inline non_primitive(x)
 contains_primitive_behind_call(x) = @inline contains_primitive(x)
+union_split_primitive_call(x::Ref{Union{Float64,Float32}}) = @inline a_primitive(x[])
+
+# Issue #955: if a primitive call's return value is inferred as `Const`,
+# the compiler may fold the call away entirely. This makes the primitive 
+# invisible to Mooncake,  so its custom `rrule!!` never runs.
+fake_grad_955(x, y) = x
+Mooncake.@is_primitive DefaultCtx ReverseMode Tuple{typeof(fake_grad_955),Any,Any}
+
+function Mooncake.rrule!!(::CoDual{typeof(fake_grad_955)}, x::CoDual, y::CoDual)
+    function fake_grad_955_pullback(dy)
+        return NoRData(), NoRData(), dy
+    end
+    return CoDual(x.x, y.dx), fake_grad_955_pullback
+end
 
 @testset "abstract_interpretation" begin
     # Check that inlining doesn't / does happen as expected.
@@ -73,6 +78,33 @@ contains_primitive_behind_call(x) = @inline contains_primitive(x)
             invoke_line = findfirst(x -> Meta.isexpr(x, :invoke), stmt(ad_ir.stmts))
             @test stmt(ad_ir.stmts)[invoke_line].args[2] == GlobalRef(Main, :a_primitive)
         end
+        @testset "no inline away union splitting" begin
+
+            # In the IR for this signature generated using the standard interpreter, calls
+            # to `a_primitive` are inlined away to calls to `sin`. One call site is
+            # generated for `Float32`, and another for `Float64` (you should take a look at
+            # the IR to see this). However, since `a_primitive` called with a `Float64` is
+            # a Mooncake primitive, this should not happen in the IR with a Mooncake
+            # interpreter. This case is different from those above in that the type being
+            # passed into `a_primitive` is abstract (Union{Float32,Float64}) rather than
+            # concrete. In early versions of Mooncake, the implementation of `is_primitive`
+            # would incorrect permit this call site to be inlined away.
+            Tx = Base.RefValue{Union{Float32,Float64}}
+            sig = Tuple{typeof(union_split_primitive_call),Tx}
+
+            # Pre-condition: a invoke sites inline away to reveal calls to `sin`.
+            usual_ir = Base.code_ircode_by_type(sig)[1][1]
+            for line in findall(x -> Meta.isexpr(x, :invoke), stmt(usual_ir.stmts))
+                @assert stmt(usual_ir.stmts)[line].args[2] == GlobalRef(Main, :sin)
+            end
+
+            # Should not inline away under AD compilation.
+            interp = Mooncake.MooncakeInterpreter(DefaultCtx, ReverseMode)
+            ad_ir = Base.code_ircode_by_type(sig; interp)[1][1]
+            for line in findall(x -> Meta.isexpr(x, :invoke), stmt(ad_ir.stmts))
+                @test stmt(ad_ir.stmts)[line].args[2] != GlobalRef(Main, :sin)
+            end
+        end
 
         # Regression test for https://github.com/chalk-lab/Mooncake.jl/issues/238
         @testset "238" begin
@@ -80,5 +112,38 @@ contains_primitive_behind_call(x) = @inline contains_primitive(x)
             fargs = (Base._mapreduce_dim, f, vcat, Float64[], [1:1, 2:2], :)
             @test Base.code_typed_by_type(typeof(fargs))[1][2] == Vector{Float64}
         end
+
+        @testset "955 - primitive call not const-folded away" begin
+            f = x -> fake_grad_955(1.0, 2x[1] + x[3])
+            x = [1.0, 2.0, 3.0]
+
+            cache = Mooncake.prepare_gradient_cache(f, x)
+            val, grad = Mooncake.value_and_gradient!!(cache, f, x)
+
+            @test val == 1.0
+            @test grad[2] == [2.0, 0.0, 1.0]
+        end
+    end
+
+    @testset "Config(empty_cache=true)" begin
+        f = x -> sin(x[1]) + x[2]^2
+        x = [1.0, 2.0]
+
+        # Build up the cache with several functions, then clear it.
+        for g in [x -> sum(x .^ 2), x -> prod(x), x -> sum(exp.(x))]
+            Mooncake.prepare_gradient_cache(g, randn(10))
+        end
+        n_before = length(Mooncake.GLOBAL_INTERPRETERS[Mooncake.ReverseMode].oc_cache)
+        @test n_before > 0
+
+        cache = Mooncake.prepare_gradient_cache(
+            f, x; config=Mooncake.Config(empty_cache=true)
+        )
+        @test length(Mooncake.GLOBAL_INTERPRETERS[Mooncake.ReverseMode].oc_cache) < n_before
+
+        # AD still correct after clearing.
+        val, grad = Mooncake.value_and_gradient!!(cache, f, x)
+        @test val ≈ sin(x[1]) + x[2]^2
+        @test grad[2] ≈ [cos(x[1]), 2x[2]]
     end
 end

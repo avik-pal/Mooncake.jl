@@ -24,8 +24,8 @@ julia> signature = Tuple{typeof(foo), Float64}
 Tuple{typeof(foo), Float64}
 
 julia> Base.code_ircode_by_type(signature)[1][1]
-2 1 ─ %1 = invoke sin(_2::Float64)::Float64
-3 │   %2 = invoke cos(%1::Float64)::Float64
+2 1 ─ %1 =    invoke sin(_2::Float64)::Float64
+3 │   %2 =    invoke cos(%1::Float64)::Float64
 4 └──      return %2
 ```
 
@@ -59,11 +59,11 @@ julia> function bar(x)
 bar (generic function with 1 method)
 
 julia> Base.code_ircode_by_type(Tuple{typeof(bar),Float64})[1][1]
-2 1 ─ %1 = Base.lt_float(0.0, _2)::Bool
-  │   %2 = Base.or_int(%1, false)::Bool
+2 1 ─ %1 = intrinsic Base.lt_float(0.0, _2)::Bool
+  │   %2 = intrinsic Base.or_int(%1, false)::Bool
   └──      goto #3 if not %2
 3 2 ─      return _2
-5 3 ─ %5 = Base.mul_float(5.0, _2)::Float64
+5 3 ─ %5 = intrinsic Base.mul_float(5.0, _2)::Float64
   └──      return %5
 ```
 In this example we see the statement `goto #3 if not %2`.
@@ -98,7 +98,7 @@ Additionally, note that `Base.lt_float` (used to check if one floating point num
 Rather, they are Julia intrinsics:
 ```jldoctest
 julia> Base.lt_float
-lt_float (intrinsic function #31)
+lt_float (intrinsic function #33)
 ```
 These intrinsics have special handling in the compiler.
 Either way, the overall point is to be aware that these kinds of low-level intrinsics exist, and appear regularly in Julia IR.
@@ -122,10 +122,10 @@ julia> ir = Base.code_ircode_by_type(Tuple{typeof(my_factorial), Int})[1][1]
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %7)::Int64
   │   %3 = φ (#1 => 0, #3 => %6)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-5 3 ─ %6 = Base.add_int(%3, 1)::Int64
-6 │   %7 = Base.mul_int(%2, %6)::Int64
+5 3 ─ %6 = intrinsic Base.add_int(%3, 1)::Int64
+6 │   %7 = intrinsic Base.mul_int(%2, %6)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
@@ -194,81 +194,84 @@ The argument types associated to the signature are stored in the `argtypes` fiel
 `IRCode` is a perfectly good way to represent Julia's IR the vast majority of the time.
 For example, it suffices for the code transformations required for forwards-mode AD.
 However, IR transformations involving multiple changes to the control flow structure of a programme are needed in reverse-mode, and are prohibitively awkward to undertake using `IRCode`.
-Mooncake's implementation of reverse-mode AD instead makes use of a custom representation of Julia's IR, called `BBCode`.
-We emphasise that `BBCode` represents the _same_ thing under the hood, it is just represented in memory in a slightly different way, such that certain kinds of transformations are straightforward to implement.
+Mooncake's implementation of reverse-mode AD instead makes use of a custom representation of Julia's IR: a vector of basic blocks, each a [`Mooncake.CFGBlock`](@ref).
+We emphasise that this represents the _same_ thing under the hood, it is just represented in memory in a slightly different way, such that certain kinds of transformations are straightforward to implement.
 
-You can construct a `BBCode` from an `IRCode`, and vice versa:
+You can construct a `Vector{CFGBlock}` from an `IRCode`, and convert it back:
 ```jldoctest my_factorial
-julia> using Mooncake: BBCode
+julia> using Mooncake: CFGBlock, _ircode_to_cfg_blocks, lower_cfg_blocks_to_ir, seed_id!
 
-julia> bb_ir = BBCode(ir);
+julia> seed_id!(); # reset the global ID counter so the IDs below are deterministic
 
-julia> bb_ir isa BBCode
+julia> blocks = _ircode_to_cfg_blocks(ir);
+
+julia> blocks isa Vector{CFGBlock}
 true
 
-julia> Core.Compiler.IRCode(bb_ir)
+julia> lower_cfg_blocks_to_ir(blocks, ir)
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %7)::Int64
   │   %3 = φ (#1 => 0, #3 => %6)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-5 3 ─ %6 = Base.add_int(%3, 1)::Int64
-6 │   %7 = Base.mul_int(%2, %6)::Int64
+5 3 ─ %6 = intrinsic Base.add_int(%3, 1)::Int64
+6 │   %7 = intrinsic Base.mul_int(%2, %6)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
-At present, `BBCode` does not display itself nicely, so to look at it we must either inspect its fields, or convert it back to an `IRCode` (which _does_ print nicely).
+A `Vector{CFGBlock}` does not display itself nicely, so to look at it we must either inspect the blocks, or convert it back to an `IRCode` (which _does_ print nicely) via [`Mooncake.lower_cfg_blocks_to_ir`](@ref).
+Note that `lower_cfg_blocks_to_ir` takes the original `IRCode` as a second argument: the block vector holds only the statements, so the remaining IR metadata (argument types, sptypes, debug info, ...) is supplied from there.
 
-Instead of storing all of the statements in a single vector (and the types in their own vector, etc), `BBCode` stores all statements associated to a particular basic block in a `Mooncake.BBlock`, and stores these in a `Vector{Mooncake.BBlock}`.
+Instead of storing all of the statements in a single vector (and the types in their own vector, etc), each `Mooncake.CFGBlock` stores all statements associated to a particular basic block.
 ```jldoctest my_factorial
-julia> typeof(bb_ir.blocks)
-Vector{BBlock} (alias for Array{Mooncake.BasicBlockCode.BBlock, 1})
+julia> typeof(blocks)
+Vector{CFGBlock} (alias for Array{CFGBlock, 1})
 ```
-Each `BBlock` has a field `insts`, containing the statements associated to that basic block.
+Each `CFGBlock` has a field `insts`, containing the statements associated to that basic block.
 This is stored as a `Vector{Core.Compiler.NewInstruction}`, because `Core.Compiler.NewInstruction` contains the 5 fields that define an instruction in `IRCode` (you should compare the fields of a `Core.Compiler.NewInstruction` with those of `Core.Compiler.InstructionStream` to see the correspondence).
 For example, consider
 ```jldoctest my_factorial
-julia> using Mooncake.BasicBlockCode: ID # to improve printing
+julia> using Mooncake: ID # to improve printing
 
-julia> bb_ir.blocks[3].insts[1]
-Core.Compiler.NewInstruction(:(Base.add_int(ID(97), 1)), Int64, Core.Compiler.NoCallInfo(), 9, 0x000012e0)
+julia> blocks[3].insts[1]
+Compiler.NewInstruction(:(Base.add_int(ID(2), 1)), Int64, Compiler.NoCallInfo(), (9, 2, 1), 0x00002478)
 ```
 This is the first instruction of the third basic block.
 The first field is a call to `Base.add_int`, the second field is `Int64` (we promise that the other fields are just copies of the corresponding data from the `Core.Compiler.InstructionStream` in the original `IRCode` representation of this IR).
 
-The other structural difference is that `BBCode` has no field containing the control-flow graph.
-Instead, the control-flow graph is represented implicitly as part of the `blocks` field.
-The upside of this is that any transformations of `blocks` which modify the CFG are automatically reflected in the `blocks` -- there is no need to perform any book-keeping to ensure that the CFG is kept in sync with the instructions.
+The other structural difference is that the `Vector{CFGBlock}` representation has no field containing the control-flow graph.
+Instead, the control-flow graph is represented implicitly by the order of the blocks and their terminators.
+The upside of this is that any transformations which modify the CFG are automatically reflected in the blocks -- there is no need to perform any book-keeping to ensure that the CFG is kept in sync with the instructions.
 This saves both time and memory when inserting new basic blocks -- when basic block structure changes, a scan of the entire `IRCode` is required to modify any statements which refer to a given block, and yields code simplifications.
 The downside is that the CFG must be computed whenever we need to know about it.
-As a resut, neither `IRCode` nor `BBCode`'s representation of the CFG is strictly better than the other.
-To extract CFG-related information from a `BBCode`, see [`Mooncake.BasicBlockCode.compute_all_successors`](@ref), [`Mooncake.BasicBlockCode.compute_all_predecessors`](@ref), and [`Mooncake.BasicBlockCode.control_flow_graph`](@ref).
+As a resut, neither `IRCode` nor the `Vector{CFGBlock}` representation of the CFG is strictly better than the other.
+To extract CFG-related information from a `Vector{CFGBlock}`, see [`Mooncake._compute_cfg_successors`](@ref), [`Mooncake._compute_cfg_predecessors`](@ref), and [`Mooncake.control_flow_graph`](@ref).
 
 
-The final major difference between `IRCode` and `BBCode` is that all ssa values in an `IRCode` (`%1`, `%2`, `%n`, etc) are replaced with unique `ID`s. The `ID` associated to a statement is stored separately from the statement in the `inst_ids` field of a `BBlock`:
+The final major difference between `IRCode` and the `CFGBlock` representation is that all ssa values in an `IRCode` (`%1`, `%2`, `%n`, etc) are replaced with unique `ID`s. The `ID` associated to a statement is stored separately from the statement in the `inst_ids` field of a `CFGBlock`:
 ```jldoctest my_factorial
-julia> bb_ir.blocks[3].inst_ids
+julia> blocks[3].inst_ids
 3-element Vector{ID}:
- ID(100)
- ID(101)
- ID(102)
+ ID(5)
+ ID(6)
+ ID(7)
 ```
 There is exactly one `ID` per instruction, and it is an error to have the same `ID` associated to multiple instructions.
-Similarly, while the number associated to a basic block in `IRCode` is a function of the number of basic blocks which preceed it, the `ID` of a basic block in `BBCode` is stored in its `id` field:
+Similarly, while the number associated to a basic block in `IRCode` is a function of the number of basic blocks which precede it, the `ID` of a basic block in the `CFGBlock` representation is stored in its `id` field:
 ```jldoctest my_factorial
-julia> bb_ir.blocks[3].id
-ID(106)
+julia> blocks[3].id
+ID(11)
 ```
-As a result of this, all references to ssa values and basic block numbers in `IRCode` are replaced with `ID`s in `BBCode`.
+As a result of this, all references to ssa values and basic block numbers in `IRCode` are replaced with `ID`s in the `CFGBlock` representation.
 The purpose of this is to guarantee that the "name" of a basic block and an instruction does not change when you insert new basic blocks and new instructions.
 We shall see how this is useful in the examples below.
 
 ## Code Transformations
 
-In what follows, we look at a few transformations of Julia's IR, and see how these can be undertaken using both `IRCode` and `BBCode`.
+In what follows, we look at a few transformations of Julia's IR, and see how these can be undertaken using both `IRCode` and the `CFGBlock` representation.
 The purpose is two-fold:
 1. to enable readers to understand the code used to implement Mooncake, and
-2. to highlight the relative merits of `IRCode` vs `BBCode`.
+2. to highlight the relative merits of `IRCode` vs the `CFGBlock` representation.
 
 ### Replacing Instructions
 
@@ -281,7 +284,7 @@ with calls of the form
 ```julia
 frule!!(f, x, y, z)
 ```
-This kind of transformation is performed in basically the same way for both `IRCode` and `BBCode`.
+This kind of transformation is performed in basically the same way for both `IRCode` and the `CFGBlock` representation.
 For example, the `mul_int` statement associated to ssa `%7` can be replaced with an `add_int` statement as follows:
 ```jldoctest my_factorial
 julia> using Core: SSAValue
@@ -303,10 +306,10 @@ julia> new_ir
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %7)::Int64
   │   %3 = φ (#1 => 0, #3 => %6)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-5 3 ─ %6 = Base.add_int(%3, 1)::Int64
-6 │   %7 = (Core.Intrinsics.add_int)(%2, %6)::Int64
+5 3 ─ %6 = intrinsic Base.add_int(%3, 1)::Int64
+6 │   %7 = intrinsic (Core.Intrinsics.add_int)(%2, %6)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
@@ -314,26 +317,29 @@ Observe that ssa `7` has been replaced with the new `:call` to `add_int`.
 Unfortunately, in order to avoid committing type-piracy against `Core.Compiler`, we cannot currently write `new_ir[SSAValue(7)][:stmt]`. (`CC.getindex` is a different function from `Base.getindex` -- the same is true for `CC.setindex!` vs `Base.setindex!`).
 In general, I would recommend defining helper functions to improve the DRYness of your code.
 
-The same transformation can be performed on `BBCode`:
+The same transformation can be performed on the `CFGBlock` representation. We first copy each
+block with `copy.(blocks)` (copying the vector alone via `copy(blocks)` would be shallow and
+share the underlying `insts` arrays). A `CFGBlock` is immutable, but its `insts` field is a
+`Vector`, so on the copy we can replace an element of it in place:
 ```jldoctest my_factorial
-julia> bb_ir_copy = copy(bb_ir);
+julia> blocks_copy = copy.(blocks);
 
-julia> old_inst = bb_ir_copy.blocks[3].insts[2]
-Core.Compiler.NewInstruction(:(Base.mul_int(ID(96), ID(100))), Int64, Core.Compiler.NoCallInfo(), 10, 0x000012e0)
+julia> old_inst = blocks_copy[3].insts[2]
+Compiler.NewInstruction(:(Base.mul_int(ID(1), ID(5))), Int64, Compiler.NoCallInfo(), (13, 3, 1), 0x00002478)
 
 julia> new_stmt = Expr(:call, Base.add_int, old_inst.stmt.args[2:end]...)
-:((Core.Intrinsics.add_int)(ID(96), ID(100)))
+:((Core.Intrinsics.add_int)(ID(1), ID(5)))
 
-julia> bb_ir_copy.blocks[3].insts[2] = CC.NewInstruction(old_inst; stmt=new_stmt);
+julia> blocks_copy[3].insts[2] = CC.NewInstruction(old_inst; stmt=new_stmt);
 
-julia> CC.IRCode(bb_ir_copy)
+julia> lower_cfg_blocks_to_ir(blocks_copy, ir)
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %7)::Int64
   │   %3 = φ (#1 => 0, #3 => %6)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-5 3 ─ %6 = Base.add_int(%3, 1)::Int64
-6 │   %7 = (Core.Intrinsics.add_int)(%2, %6)::Int64
+5 3 ─ %6 = intrinsic Base.add_int(%3, 1)::Int64
+6 │   %7 = intrinsic (Core.Intrinsics.add_int)(%2, %6)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
@@ -341,7 +347,7 @@ As you can see, in both cases we wind up with the same `IRCode` at the end.
 
 ### Inserting New Instructions
 
-Inserting entirely new instructions into the IR requires a little more thought, but is ultimately very straightforward using either `IRCode` or `BBCode`.
+Inserting entirely new instructions into the IR requires a little more thought, but is ultimately very straightforward using either `IRCode` or the `CFGBlock` representation.
 
 First, `IRCode`.
 Suppose that we wish to insert another instruction immediately before the first `add_int` instruction which multiplies `%3` by 2 before adding `1` to it in `#3`.
@@ -350,7 +356,7 @@ Consequently, we need to replace all existing uses of e.g. `%6` with uses of `%7
 Happily, `IRCode` has a mechanism to achieve just this.
 ```jldoctest my_factorial
 julia> ni = CC.NewInstruction(Expr(:call, Base.mul_int, SSAValue(3), 2), Int)
-Core.Compiler.NewInstruction(:((Core.Intrinsics.mul_int)(%3, 2)), Int64, Core.Compiler.NoCallInfo(), nothing, nothing)
+Compiler.NewInstruction(:((Core.Intrinsics.mul_int)(%3, 2)), Int64, Compiler.NoCallInfo(), nothing, nothing)
 
 julia> new_ssa = CC.insert_node!(new_ir, SSAValue(6), ni)
 :(%10)
@@ -359,11 +365,11 @@ julia> new_ir
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %7)::Int64
   │   %3 = φ (#1 => 0, #3 => %6)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-5 3 ─      (Core.Intrinsics.mul_int)(%3, 2)::Int64
-  │   %6 = Base.add_int(%3, 1)::Int64
-6 │   %7 = (Core.Intrinsics.add_int)(%2, %6)::Int64
+5 3 ─      intrinsic (Core.Intrinsics.mul_int)(%3, 2)::Int64
+  │   %6 = intrinsic Base.add_int(%3, 1)::Int64
+6 │   %7 = intrinsic (Core.Intrinsics.add_int)(%2, %6)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
@@ -387,11 +393,11 @@ julia> new_ir
   1 ─       nothing::Nothing
 4 2 ┄ %2  = φ (#1 => 1, #3 => %7)::Int64
   │   %3  = φ (#1 => 0, #3 => %6)::Int64
-  │   %4  = Base.slt_int(%3, _2)::Bool
+  │   %4  = intrinsic Base.slt_int(%3, _2)::Bool
   └──       goto #4 if not %4
-5 3 ─ %10 = (Core.Intrinsics.mul_int)(%3, 2)::Int64
-  │   %6  = Base.add_int(%10, 1)::Int64
-6 │   %7  = (Core.Intrinsics.add_int)(%2, %6)::Int64
+5 3 ─ %10 = intrinsic (Core.Intrinsics.mul_int)(%3, 2)::Int64
+  │   %6  = intrinsic Base.add_int(%10, 1)::Int64
+6 │   %7  = intrinsic (Core.Intrinsics.add_int)(%2, %6)::Int64
 7 └──       goto #2
 8 4 ─       return %2
 
@@ -399,11 +405,11 @@ julia> new_ir = CC.compact!(new_ir)
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %8)::Int64
   │   %3 = φ (#1 => 0, #3 => %7)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-5 3 ─ %6 = (Core.Intrinsics.mul_int)(%3, 2)::Int64
-  │   %7 = Base.add_int(%6, 1)::Int64
-6 │   %8 = (Core.Intrinsics.add_int)(%2, %7)::Int64
+5 3 ─ %6 = intrinsic (Core.Intrinsics.mul_int)(%3, 2)::Int64
+  │   %7 = intrinsic Base.add_int(%6, 1)::Int64
+6 │   %8 = intrinsic (Core.Intrinsics.add_int)(%2, %7)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
@@ -411,56 +417,56 @@ Observe that, before `compact!`-ing, the first instruction in basic block `#3` i
 After `compact!`-ing, we have standard sequentially-labelled IR again.
 Note that the above is exactly the kind of thing that we do in our implementation of forwards-mode AD -- all insertions of nodes are performed in a single pass over the `IRCode`, and `CC.compact!` is called once at the end.
 
-Performing this transformation using `BBCode` is similarly straightforward.
-Since the name associated to instructions does not change when you insert another instruction, you really just need to insert an instruction + its `ID`, update the next instruction (as before), and you're done:
+Performing this transformation using the `CFGBlock` representation is similarly straightforward.
+Since the `ID` associated to an instruction does not change when you insert another instruction, you just need to build a new block with the extra instruction (and its `ID`) spliced in, update the next instruction (as before), and you're done.
+Because a `CFGBlock` is immutable, "inserting" means constructing a replacement block:
 ```jldoctest my_factorial
-julia> using Mooncake.BasicBlockCode: ID, new_inst
+julia> using Mooncake: ID, new_inst
 
-julia> new_id = ID() # this produces a new unique `ID`.
-ID(108)
+julia> new_id = ID(); # this produces a new unique `ID`.
 
-julia> target_id = bb_ir_copy.blocks[3].insts[1].stmt.args[2] # find `ID` of argument to add_int.
-ID(97)
+julia> blk = blocks_copy[3];
+
+julia> target_id = blk.insts[1].stmt.args[2]; # find `ID` of argument to add_int.
 
 julia> ni = new_inst(Expr(:call, Base.mul_int, target_id, 2), Int);
 
-julia> insert!(bb_ir_copy.blocks[3], 1, new_id, ni)
+julia> blocks_copy[3] = CFGBlock(blk.id, vcat(new_id, blk.inst_ids), vcat(ni, blk.insts));
 
-julia> bb_ir_copy.blocks[3].insts[2].stmt.args[2] = new_id
-ID(108)
+julia> blocks_copy[3].insts[2].stmt.args[2] = new_id;
 
-julia> CC.IRCode(bb_ir_copy)
+julia> lower_cfg_blocks_to_ir(blocks_copy, ir)
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %8)::Int64
   │   %3 = φ (#1 => 0, #3 => %7)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #4 if not %4
-2 3 ─ %6 = (Core.Intrinsics.mul_int)(%3, 2)::Int64
-5 │   %7 = Base.add_int(%6, 1)::Int64
-6 │   %8 = (Core.Intrinsics.add_int)(%2, %7)::Int64
+2 3 ─ %6 = intrinsic (Core.Intrinsics.mul_int)(%3, 2)::Int64
+5 │   %7 = intrinsic Base.add_int(%6, 1)::Int64
+6 │   %8 = intrinsic (Core.Intrinsics.add_int)(%2, %7)::Int64
 7 └──      goto #2
 8 4 ─      return %2
 ```
-We see here that `IRCode` and `BBCode` involve similar levels of complexity to insert an instruction.
+We see here that `IRCode` and the `CFGBlock` representation involve similar levels of complexity to insert an instruction.
 
 ### Inserting New Basic Blocks
 
-This is the situation in which the design of `BBCode` shines vs `IRCode`.
+This is the situation in which the design of the `CFGBlock` representation shines vs `IRCode`.
 `IRCode` does not, at present, really have much to say about transformations which change control flow.
-It is, however, straightforward using `BBCode`.
+It is, however, straightforward using a `Vector{CFGBlock}`.
 Suppose that we wish to modify the above to display the value of `%2` if it is even on any given iteration.
 Since this involves control flow, it necessarily requires at least one additional basic block.
 
 We do this in two steps.
 We first insert an additional basic block between blocks `#3` and `#4` which always prints out the value of `%2`, and then goes to block `#2`:
 ```jldoctest my_factorial
-julia> using Mooncake.BasicBlockCode: BBlock, new_inst, IDGotoNode, IDGotoIfNot
+julia> using Mooncake: CFGBlock, new_inst, IDGotoNode, IDGotoIfNot
 
-julia> block_2_id = bb_ir_copy.blocks[2].id;
+julia> block_2_id = blocks_copy[2].id;
 
 julia> new_bb_id = ID();
 
-julia> new_bb = BBlock(
+julia> new_bb = CFGBlock(
            new_bb_id,
            ID[ID(), ID()],
            CC.NewInstruction[
@@ -469,70 +475,91 @@ julia> new_bb = BBlock(
            ],
        );
 
-julia> insert!(bb_ir_copy.blocks, 4, new_bb);
+julia> insert!(blocks_copy, 4, new_bb);
 
-julia> CC.IRCode(bb_ir_copy)
+julia> lower_cfg_blocks_to_ir(blocks_copy, ir)
   1 ─      nothing::Nothing
 4 2 ┄ %2 = φ (#1 => 1, #3 => %8)::Int64
   │   %3 = φ (#1 => 0, #3 => %7)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #5 if not %4
-2 3 ─ %6 = (Core.Intrinsics.mul_int)(%3, 2)::Int64
-5 │   %7 = Base.add_int(%6, 1)::Int64
-6 │   %8 = (Core.Intrinsics.add_int)(%2, %7)::Int64
+2 3 ─ %6 = intrinsic (Core.Intrinsics.mul_int)(%3, 2)::Int64
+5 │   %7 = intrinsic Base.add_int(%6, 1)::Int64
+6 │   %8 = intrinsic (Core.Intrinsics.add_int)(%2, %7)::Int64
 7 └──      goto #2
-2 4 ─      (println)(%2)::Any
+2 4 ─        dynamic (println)(%2)::Any
   └──      goto #2
 8 5 ─      return %2
 ```
 Observe that, in this case, rather than creating `new_bb` and then inserting instructions into it, we simply create the block _with_ the instructions.
 This programming style is often more convenient.
 Additionally note that we create an `ID` for each statement in the new basic block.
-These `ID`s are never actually used anywhere, but `BBCode` requires that each instruction be associated to an `ID`, so we must create them.
+These `ID`s are never actually used anywhere, but the `CFGBlock` representation requires that each instruction be associated to an `ID`, so we must create them.
 
-Additionally, note the usage of an [`Mooncake.BasicBlockCode.IDGotoNode`](@ref).
+Additionally, note the usage of an [`Mooncake.IDGotoNode`](@ref).
 This is exactly the same thing as a `Core.Compiler.GotoNode`, except it contains an `ID` stating which basic block to jump to, rather than an `Int`.
-Similarly, the [`Mooncake.BasicBlockCode.IDGotoIfNot`](@ref) is a direct translation of `Core.Compiler.GotoIfNot`, with the `dest` field being an `ID` rather than an `Int`.
+Similarly, the [`Mooncake.IDGotoIfNot`](@ref) is a direct translation of `Core.Compiler.GotoIfNot`, with the `dest` field being an `ID` rather than an `Int`.
 
 Furthermore, note that the `goto if not` instruction at the end of basic block `#2` now (correctly) jumps to basic block `#5`, whereas before it jumped to block `#4`.
-That is, by virtue of the fact that the `ID` associated to each basic block remains unchanged in `BBCode`, all pre-existing control flow relationships have remained the same.
+That is, by virtue of the fact that the `ID` associated to each basic block remains unchanged in the `CFGBlock` representation, all pre-existing control flow relationships have remained the same.
 Moreover, we did not have to write any book-keeping code to ensure that this update happened correctly.
 
 Now that we've created the new basic block, we modify block `#3` to fall-through to the new block if `%2` is even, and to jump straight back to block `#2` if not:
 ```jldoctest my_factorial
-julia> bb = bb_ir_copy.blocks[3];
+julia> blk = blocks_copy[3];
 
 julia> cond_id = ID();
 
-julia> target_id = bb_ir_copy.blocks[2].inst_ids[1];
+julia> target_id = blocks_copy[2].inst_ids[1];
 
-julia> insert!(bb, 4, cond_id, new_inst(Expr(:call, iseven, target_id)));
+julia> cond_inst = new_inst(Expr(:call, iseven, target_id));
 
-julia> bb.insts[end] = new_inst(IDGotoIfNot(cond_id, block_2_id));
+julia> blocks_copy[3] = CFGBlock(
+           blk.id,
+           vcat(blk.inst_ids[1:(end - 1)], cond_id, blk.inst_ids[end]),
+           vcat(blk.insts[1:(end - 1)], cond_inst, blk.insts[end]),
+       );
 
-julia> new_ir = CC.IRCode(bb_ir_copy)
+julia> blocks_copy[3].insts[end] = new_inst(IDGotoIfNot(cond_id, block_2_id));
+
+julia> for inst in blocks_copy[2].insts[1:2]
+           # Block #4 only prints before jumping back, so reuse block #3's updated values.
+           phi = inst.stmt
+           value = phi.values[findfirst(==(blk.id), phi.edges)]
+           push!(phi.edges, new_bb_id)
+           push!(phi.values, value)
+       end;
+
+julia> new_ir = lower_cfg_blocks_to_ir(blocks_copy, ir)
   1 ─      nothing::Nothing
-4 2 ┄ %2 = φ (#1 => 1, #3 => %8)::Int64
-  │   %3 = φ (#1 => 0, #3 => %7)::Int64
-  │   %4 = Base.slt_int(%3, _2)::Bool
+4 2 ┄ %2 = φ (#1 => 1, #3 => %8, #4 => %8)::Int64
+  │   %3 = φ (#1 => 0, #3 => %7, #4 => %7)::Int64
+  │   %4 = intrinsic Base.slt_int(%3, _2)::Bool
   └──      goto #5 if not %4
-2 3 ─ %6 = (Core.Intrinsics.mul_int)(%3, 2)::Int64
-5 │   %7 = Base.add_int(%6, 1)::Int64
-6 │   %8 = (Core.Intrinsics.add_int)(%2, %7)::Int64
-2 │   %9 = (iseven)(%2)::Any
+2 3 ─ %6 = intrinsic (Core.Intrinsics.mul_int)(%3, 2)::Int64
+5 │   %7 = intrinsic Base.add_int(%6, 1)::Int64
+6 │   %8 = intrinsic (Core.Intrinsics.add_int)(%2, %7)::Int64
+2 │   %9 =   dynamic (iseven)(%2)::Any
   └──      goto #2 if not %9
-  4 ─      (println)(%2)::Any
+  4 ─        dynamic (println)(%2)::Any
   └──      goto #2
 8 5 ─      return %2
 ```
 Observe that in order to tie the conditional to the goto-if-not, we simply ensure that the `ID` associated to the instruction which computes the conditional appears in the `IDGotoIfNot` instruction.
+The loop header now has an additional predecessor, so both phi nodes must also accept values from the new block.
+Since that block only prints, it forwards the same updated values as block `#3`.
 
 ### Run the new code
 
-As ever, we can construct a `Core.OpaqueClosure` using `IRCode` in order to produce something runnable:
+As ever, we can construct a `Core.OpaqueClosure` using `IRCode` in order to produce something runnable.
+Since `new_ir` originated as method IR, its first argument type still corresponds to the
+function object rather than the opaque-closure environment tuple. For a zero-capture
+opaque closure, we therefore first rewrite `argtypes[1]` to `Tuple{}`:
 ```jldoctest my_factorial
+julia> new_ir.argtypes[1] = Tuple{};
+
 julia> oc = Core.OpaqueClosure(new_ir; do_compile=true)
-(::Int64)::Int64->◌
+(::Int64)->◌::Int64
 
 julia> oc(1000)
 2
@@ -549,11 +576,11 @@ The point is that we've successfully inserted a new basic block into Julia's IR,
 
 We have reviewed the two representations of Julia IR used in Mooncake.
 Where possible, we always use `IRCode` -- as discussed, forwards-mode AD exclusively uses `IRCode`.
-`BBCode` is basically only needed when undertaking transformations which involve changes to basic block structure -- the insertion of new basic blocks, and the modification of terminators in a way which changes the predecessors / successors of a given block being the primary sources of these kinds of changes.
-Reverse-mode AD makes extensive use of such transformations, so `BBCode` is currently important there.
+The `CFGBlock` representation is basically only needed when undertaking transformations which involve changes to basic block structure -- the insertion of new basic blocks, and the modification of terminators in a way which changes the predecessors / successors of a given block being the primary sources of these kinds of changes.
+Reverse-mode AD makes extensive use of such transformations, so the `CFGBlock` representation is currently important there.
 
 There are efforts such as [this PR](https://github.com/JuliaLang/julia/pull/45305) to augment `IRCode` with the capability to manipulate the CFG structure in a convenient manner.
-Ideally these efforts will succeed, then we can do away with `BBCode`.
+Ideally these efforts will succeed, then we can do away with the `CFGBlock` representation.
 
 ### Comparison with Alternative Approaches
 
@@ -563,6 +590,5 @@ For readers interested in learning more about Julia's IR representation beyond w
 
 ## Docstrings
 
-```@autodocs; canonical=true
-Modules = [Mooncake.BasicBlockCode]
-```
+The working-IR types and helpers (`CFGBlock`, `ID`, `_ircode_to_cfg_blocks`,
+`lower_cfg_blocks_to_ir`, ...) are documented in [Internal Docstrings](@ref).
